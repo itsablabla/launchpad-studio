@@ -1,0 +1,25 @@
+# Build context for deploy/Dockerfile is the repo root. Everything here is
+# excluded from COPY . . in the rust-builder stage (and from the frontend
+# stages' COPY frontend/ .).
+
+# Rust build artifacts — the single largest offender, and never valid inside
+# a Linux container even when present (macOS-compiled).
+target/
+**/target/
+
+# Frontend installs/builds — npm ci and vite build reproduce both.
+frontend/node_modules/
+frontend/dist/
+
+# VCS and local state.
+.git/
+.gitignore
+
+# Local credentials/config that must never be baked into an image.
+.env
+.env.*
+!.env.example
+providers.toml
+
+# Editor/OS noise.
+.DS_Store

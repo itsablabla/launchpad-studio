@@ -1,0 +1,52 @@
+# Launchpad headless deployment — backend API + static frontend.
+#
+# Build context for both services is the repo root (compose file lives in
+# deploy/, so `context: ..`), which the repo-root .dockerignore trims.
+#
+#   docker compose -f deploy/docker-compose.yml build
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Set VITE_API_BASE_URL in the shell (or a sibling .env next to this file —
+# compose reads deploy/.env) BEFORE building the frontend; it is baked into
+# the JS bundle at build time, not read at runtime:
+#
+#   VITE_API_BASE_URL=http://192.168.1.150:3101 \
+#     docker compose -f deploy/docker-compose.yml build frontend
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: backend
+    image: launchpad-backend:local
+    # AO_PORT / AO_BIND_HOST / LAUNCHPAD_STUDIO_DATA_DIR /
+    # LAUNCHPAD_SECRET_VAULT_FILE_FALLBACK defaults are ENV-baked into the
+    # image (see deploy/Dockerfile). Override here only to change them —
+    # keep the port mapping's right-hand side in sync with AO_PORT.
+    ports:
+      - "3101:3101"
+    volumes:
+      # ALL backend state lives under this data root: agents, transcripts,
+      # memories, providers.toml, the file-backed secret vault
+      # (secret_vault.json), scheduled tasks, the workspace lock.
+      - launchpad-data:/data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: frontend
+      args:
+        # The address LAN browsers use to reach the backend. Build-time only.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:3101}
+    image: launchpad-frontend:local
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  launchpad-data:
