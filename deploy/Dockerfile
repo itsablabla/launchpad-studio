@@ -83,10 +83,13 @@ RUN npm run build
 FROM debian:bookworm-slim AS backend
 
 # ca-certificates: outbound TLS to model providers / Matrix homeservers /
-# Telegram. curl: HEALTHCHECK only.
+# Telegram. curl: HEALTHCHECK only. libdbus-1-3: ao-server links libdbus at
+# RUNTIME via nosleep-nix (nosleep in ao-engine) — the builder's
+# libdbus-1-dev covers compile time, this covers the runtime .so.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root daemon user. The data root lives on the compose-managed named
