@@ -26,7 +26,19 @@ const RECONNECT_GRACE_MS = 500;
 export function useSSE(agentId: string | null): { connected: boolean } {
   const [connected, setConnected] = useState(false);
   const subscriptionRef = useRef<HubSubscription | null>(null);
-  const receivedContentRef = useRef(false);
+  // "Did this run produce anything the user can see?" — gates the
+  // run_ended "no output" warning. Text counts, but so does any other
+  // visible output: a tool row, a form, an agent-action chip all prove the
+  // agent is alive and working, so a tool-only or form-only turn must not
+  // warn as if the process exited immediately.
+  //
+  // Keyed per in-flight thread (same keyFor shape the in-flight store
+  // uses): a single agent-wide boolean bled across threads when
+  // max_instances > 1 ran two threads concurrently — thread B's content
+  // masked thread A's empty completion, and A's run_started reset armed a
+  // false warning for B. run_ended reads AND deletes its key so a finished
+  // run's entry can't leak into a later run on the same thread.
+  const receivedContentRef = useRef(new Map<string, boolean>());
   // Keyed by inFlightKey (plain agent id, or an agent+thread composite) —
   // the SSE channel is per-agent, but in-flight state (and therefore what
   // needs re-confirming on reconnect) is per-thread, so a single ref can't
@@ -162,9 +174,9 @@ export function useSSE(agentId: string | null): { connected: boolean } {
 
       run_started(e) {
         if (isTasklistChannelEvent(e.data)) return;
-        receivedContentRef.current = false;
         const data = parsePayloadData(e.data);
         const key = keyFor(id, data);
+        receivedContentRef.current.set(key, false);
         cancelGraceTimer(key);
         store().ensureInFlight(key);
         store().patchAgentSnapshot(id, { has_active_run: true });
@@ -173,10 +185,12 @@ export function useSSE(agentId: string | null): { connected: boolean } {
       tool_call_started(e) {
         const data = parsePayloadData(e.data);
         if (data?.tool_name) {
+          receivedContentRef.current.set(keyFor(id, data), true);
           store().addInFlightToolCall(keyFor(id, data), {
             tool: data.tool_name as string,
             input: data.tool_input as Record<string, unknown> | undefined,
             label: data.label as string | undefined,
+            toolUseId: data.tool_use_id as string | undefined,
           });
         }
       },
@@ -184,7 +198,22 @@ export function useSSE(agentId: string | null): { connected: boolean } {
       tool_call_completed(e) {
         const data = parsePayloadData(e.data);
         const key = keyFor(id, data);
-        store().markInFlightToolCallDone(key);
+        // A completion with output is visible content too — and it re-arms
+        // the flag for the reconnect-in-the-quiet-tail case: the agent_busy
+        // reset clears it, and a run that ends text→tool→done may only emit
+        // tool_call_completed (not a started) after the reconnect.
+        if (data?.tool_use_id != null || data?.tool_name != null) {
+          receivedContentRef.current.set(key, true);
+        }
+        // Carry the completion's output/is_error into the turn's persistent
+        // tool transcript (the chip becomes a collapsed ToolCallGroup row).
+        // tool_use_id joins the completion to the right chip when parallel
+        // calls finish out of order (droid/claude CLI thread it through).
+        store().markInFlightToolCallDone(key, {
+          output: typeof data?.output === "string" ? data.output : data?.output != null ? JSON.stringify(data.output) : undefined,
+          isError: (data?.is_error as boolean | undefined) ?? undefined,
+          toolUseId: data?.tool_use_id as string | undefined,
+        });
         // Note: an async Delegate's own spawn call failing outright (e.g. no
         // spawner wired, bad target) needs no cleanup here — the backend only
         // emits `delegate.started` (which drives `beginDelegateRun`) after
@@ -213,6 +242,7 @@ export function useSSE(agentId: string | null): { connected: boolean } {
       tool_use_started(e) {
         const data = parsePayloadData(e.data);
         if (data?.tool_use_id && data?.tool_name) {
+          receivedContentRef.current.set(keyFor(id, data), true);
           store().addInFlightToolUse(
             keyFor(id, data),
             data.tool_use_id as string,
@@ -265,19 +295,15 @@ export function useSSE(agentId: string | null): { connected: boolean } {
         if (isTasklistChannelEvent(e.data)) return;
         const data = parsePayloadData(e.data);
         if (data?.text != null) {
-          receivedContentRef.current = true;
           const key = keyFor(id, data);
-          // Clear classic tool-call chips (pre-streaming) but preserve agent
-          // action chips — those close via agent_action_completed.
-          useChatStore.setState((state) => {
-            const current = state.inFlightByAgent.get(key);
-            if (!current || current.activeToolCalls.length === 0) return state;
-            const filtered = current.activeToolCalls.filter((tc) => tc.action_id != null);
-            if (filtered.length === current.activeToolCalls.length) return state;
-            const next = new Map(state.inFlightByAgent);
-            next.set(key, { ...current, activeToolCalls: filtered });
-            return { inFlightByAgent: next };
-          });
+          receivedContentRef.current.set(key, true);
+          // Flush classic tool-call chips into the turn's persistent
+          // transcript (they render as ToolCallGroup rows from there) but
+          // preserve agent action chips — those close via
+          // agent_action_completed. Salvage, NOT delete: a call that is still
+          // running when the model starts talking must not vanish — its
+          // completion later patches the salvaged record by id.
+          store().flushClassicToolCalls(key);
           store().appendInFlightDelta(key, data.text as string);
         }
       },
@@ -287,6 +313,7 @@ export function useSSE(agentId: string | null): { connected: boolean } {
         const actionId = data?.action_id as string | undefined;
         const summary = data?.summary as string | undefined;
         if (actionId && summary) {
+          receivedContentRef.current.set(keyFor(id, data), true);
           store().addInFlightAgentAction(keyFor(id, data), actionId, summary);
         }
       },
@@ -335,6 +362,12 @@ export function useSSE(agentId: string | null): { connected: boolean } {
         if (isTasklistChannelEvent(e.data)) return;
         const data = parsePayloadData(e.data);
         if (data?.text != null) {
+          // A lone text_complete (no preceding text_delta — the backend has
+          // direct-emit paths) is still a visible reply; whitespace-only is
+          // not (mirrors the relay observer's empty-text convention).
+          if ((data.text as string).trim().length > 0) {
+            receivedContentRef.current.set(keyFor(id, data), true);
+          }
           // Finalizes the agent message into the transcript but keeps the
           // in-flight entry alive — the bubble stays mounted across any
           // skill-load handoff and the next RunStarted/text_delta picks up
@@ -427,7 +460,28 @@ export function useSSE(agentId: string | null): { connected: boolean } {
         // refetches from disk, where `persist_pending` did its job). One
         // layer of belt for one layer of suspenders.
         const inFlightEntry = useChatStore.getState().inFlightByAgent.get(key);
-        if (inFlightEntry && (inFlightEntry.textBuffer.length > 0 || inFlightEntry.artifactIds.length > 0)) {
+        // Snapshot the content evidence BEFORE the salvage finalize below —
+        // finalize may clear textBuffer, and the no-output verdict (further
+        // down) falls back on this local evidence: the in-flight entry
+        // survives reconnects while the receivedContent flag does not
+        // (agent_busy re-arms it to false on the replayed connection), so a
+        // reconnect landing in a run's quiet tail — content seen before the
+        // drop, only a completion after — must still read as "produced
+        // output" instead of warning over the reply it is finalizing.
+        const hadLocalEvidence =
+          (inFlightEntry?.textBuffer.length ?? 0) > 0 ||
+          (inFlightEntry?.artifactIds.length ?? 0) > 0 ||
+          (inFlightEntry?.completedToolCalls?.length ?? 0) > 0;
+        if (
+          inFlightEntry &&
+          (inFlightEntry.textBuffer.length > 0 ||
+            inFlightEntry.artifactIds.length > 0 ||
+            // Tool-only turn (no text ever streamed — e.g. an error before the
+            // first token): finalize so the salvaged tool rows get stamped
+            // onto a transcript entry instead of dying with the teardown
+            // timer, where a fast follow-up message would inherit them.
+            (inFlightEntry.completedToolCalls?.length ?? 0) > 0)
+        ) {
           store().finalizeInFlightText(key, inFlightEntry.textBuffer);
         }
 
@@ -479,7 +533,17 @@ export function useSSE(agentId: string | null): { connected: boolean } {
           label = "The agent encountered an error and the run was terminated. Check agent profile settings or try again.";
         }
 
-        if (!label && reason === "Completed" && !receivedContentRef.current) {
+        // Read-and-delete: this run's verdict must not linger into the next
+        // run on the same thread (run_started re-seeds the key, but a
+        // run_ended with no matching run_started — e.g. one lost on a
+        // dropped connection — would otherwise consult a stale entry).
+        // hadLocalEvidence is the reconnect-surviving fallback — see its
+        // snapshot above.
+        const receivedContent =
+          receivedContentRef.current.get(key) === true || hadLocalEvidence;
+        receivedContentRef.current.delete(key);
+
+        if (!label && reason === "Completed" && !receivedContent) {
           label = "Run completed but no output was received. The agent may have exited immediately — check the agent profile configuration.";
         }
 
@@ -521,6 +585,13 @@ export function useSSE(agentId: string | null): { connected: boolean } {
         // different thread, with no matching run_ended ever arriving to clear
         // it. keyFor is unchanged — it already read `thread_id` correctly.
         const key = keyFor(id, parsePayloadData(e.data));
+        // A replayed busy means a run is in flight whose content THIS
+        // connection hasn't seen (its run_started went to the dropped
+        // connection). Reset so the no-output warning judges only what
+        // arrives from here — a stale `true` latched by a previous run
+        // would otherwise suppress the warning for exactly the
+        // misconfigured-agent case it exists for.
+        receivedContentRef.current.set(key, false);
         cancelGraceTimer(key);
         store().ensureInFlight(key);
       },
@@ -945,6 +1016,10 @@ export function useSSE(agentId: string | null): { connected: boolean } {
         // `pendingFormByAgent`'s docstring in chatStore.ts.
         const data = parsePayloadData(e.data) as FormRequestPayload | null;
         if (!data?.form_id) return;
+        receivedContentRef.current.set(
+          inFlightKey(id, typeof data.thread_id === "string" ? data.thread_id : undefined),
+          true,
+        );
         store().setPendingForm(id, data);
       },
 
@@ -967,6 +1042,13 @@ export function useSSE(agentId: string | null): { connected: boolean } {
       form_posted(e) {
         const data = parsePayloadData(e.data) as FormPostedPayload | null;
         if (!data?.form_id) return;
+        // An async-form-only turn ends Completed with no text (it parks
+        // awaiting the answer) — the visible form card is the output, so
+        // the no-output warning must not fire for it.
+        receivedContentRef.current.set(
+          inFlightKey(id, typeof data.thread_id === "string" ? data.thread_id : undefined),
+          true,
+        );
         const formId = data.form_id;
         const eventThreadId = typeof data.thread_id === "string" ? data.thread_id : undefined;
         // Wrap the event's flat spec in the `{form_id, spec, mode}` envelope

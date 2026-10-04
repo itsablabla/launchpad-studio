@@ -771,6 +771,7 @@ mod tests {
                 persistence: Arc::clone(&self.persistence),
                 queue_registry: Arc::clone(&self.queue_registry),
                 connection_state: Arc::clone(&self.connection_state),
+                owner_id: "test-owner".to_string(),
                 lease_gate: Arc::clone(&self.lease_gate),
                 event_bus: Arc::clone(&self.event_bus),
             }
@@ -870,6 +871,7 @@ mod tests {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
                     max_output_tokens: None,

@@ -47,12 +47,14 @@ pub async fn provision_bridge_thread(
     // rather than routing every conversation through one
     // eagerly-provisioned thread — the same shape Slack has always used —
     // so there is nothing to provision here at bind-enable time.
+    // Matrix follows the mint-on-demand shape from day one
+    // (`resolve_matrix_conversation_thread`, landing with the transport).
     // `binding.bridge_thread_id` is left `None` permanently; a binding
     // provisioned before this change keeps its legacy thread as a viewable,
     // no-longer-written-to artifact rather than having it reassigned.
     if matches!(
         binding.kind_config,
-        ChannelKindConfig::Discord { .. } | ChannelKindConfig::Telegram { .. } | ChannelKindConfig::Email { .. }
+        ChannelKindConfig::Discord { .. } | ChannelKindConfig::Telegram { .. } | ChannelKindConfig::Email { .. } | ChannelKindConfig::Matrix { .. }
     ) {
         return Ok(());
     }
@@ -91,5 +93,8 @@ fn bridge_thread_title(binding: &ChannelBinding) -> Option<String> {
         ChannelKindConfig::Email { .. } => None, // unreachable in practice; kept for match exhaustiveness
         ChannelKindConfig::Discord { .. } => None, // unreachable in practice; kept for match exhaustiveness
         ChannelKindConfig::Slack { .. } => Some("💬 Slack".to_string()),
+        // Like Telegram/Discord/Email: Matrix mints a fresh per-room thread
+        // on demand, so provisioning returns early before reaching this arm.
+        ChannelKindConfig::Matrix { .. } => None,
     }
 }

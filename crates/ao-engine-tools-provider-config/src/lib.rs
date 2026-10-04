@@ -20,6 +20,7 @@ pub use ao_protocol::data_root::resolve_data_root;
 pub use anthropic::AnthropicConfig;
 pub use channel_secret_store::{
     ChannelSecretStore, ChannelSecretStoreError, DISCORD_TOKEN_SECRET_ROLE, EMAIL_PASSWORD_SECRET_ROLE,
+    MATRIX_DEVICE_ID_SECRET_ROLE, MATRIX_STORE_PASSPHRASE_SECRET_ROLE, MATRIX_TOKEN_SECRET_ROLE,
     SLACK_APP_TOKEN_SECRET_ROLE, SLACK_BOT_TOKEN_SECRET_ROLE,
 };
 pub use gemini::GeminiConfig;

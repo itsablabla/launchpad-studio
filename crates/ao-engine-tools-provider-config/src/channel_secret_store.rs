@@ -82,6 +82,24 @@ pub const SLACK_BOT_TOKEN_SECRET_ROLE: &str = "slack_bot_token";
 /// two secrets, same pattern the module doc describes.
 pub const SLACK_APP_TOKEN_SECRET_ROLE: &str = "slack_app_token";
 
+/// Secret role for a Matrix binding's access token, obtained via
+/// `POST /login` (username+password setup path — the password itself is
+/// never stored) or pasted directly (advanced path).
+pub const MATRIX_TOKEN_SECRET_ROLE: &str = "matrix_token";
+
+/// Secret role for the Matrix `device_id` minted at login. Not a secret in
+/// the cryptographic sense, but vaulted alongside the token because the two
+/// are only ever valid as a pair: restoring a session with the token but a
+/// fresh device id makes previously-received encrypted messages
+/// undecryptable (the documented E2EE pitfall), so they live and die
+/// together.
+pub const MATRIX_DEVICE_ID_SECRET_ROLE: &str = "matrix_device_id";
+
+/// Secret role for the passphrase protecting the Matrix crypto store
+/// (megolm/olm keys at rest under the agent's data root). Generated once at
+/// first login, vaulted, and reused on every startup.
+pub const MATRIX_STORE_PASSPHRASE_SECRET_ROLE: &str = "matrix_store_passphrase";
+
 #[derive(Debug, Error)]
 pub enum ChannelSecretStoreError {
     #[error("data root resolver failed: {0}")]

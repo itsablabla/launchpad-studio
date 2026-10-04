@@ -140,7 +140,7 @@ describe("tool_call_completed → live inline artifact card", () => {
     expect(useChatStore.getState().inFlightByAgent.get(AGENT_ID)?.artifactIds).toEqual([]);
   });
 
-  it("marks the in-flight tool-call chip done rather than removing it (jumpy-indicator fix)", () => {
+  it("clears the in-flight tool-call chip on completion WITHOUT a transcript row (skip-listed)", () => {
     useChatStore.getState().ensureInFlight(AGENT_ID);
     useChatStore.getState().addInFlightToolCall(AGENT_ID, { tool: "ArtifactWrite" });
     mountHarness(AGENT_ID);
@@ -151,12 +151,13 @@ describe("tool_call_completed → live inline artifact card", () => {
       output: JSON.stringify({ id: "artifact-live-2", renderer: "table", refresh_intent: "none", title: "T" }),
     });
 
-    // The chip stays stacked (marked done) — see markInFlightToolCallDone —
-    // rather than being popped, so the bubble doesn't shrink until text_delta
-    // /finalize/run_ended actually flushes the classic-chip stack.
-    const calls = useChatStore.getState().inFlightByAgent.get(AGENT_ID)?.activeToolCalls;
-    expect(calls).toHaveLength(1);
-    expect(calls?.[0].done).toBe(true);
+    // The chip leaves the indicator stack, but ArtifactWrite is in
+    // TOOL_ROW_SKIP — the inline artifact card is its rendering, so no
+    // ToolCallGroup row is stamped (matching the history pairing, which skips
+    // it too — otherwise the row would vanish on every refetch).
+    const entry = useChatStore.getState().inFlightByAgent.get(AGENT_ID);
+    expect(entry?.activeToolCalls).toHaveLength(0);
+    expect(entry?.completedToolCalls ?? []).toHaveLength(0);
   });
 
   it("scopes the appended id to the thread-composite in-flight key when the event carries a thread_id", () => {

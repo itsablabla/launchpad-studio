@@ -456,6 +456,7 @@ mod tasklist_tag_dispatch {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
                     max_output_tokens: None,
@@ -1873,6 +1874,7 @@ mod fresh_thread_reply_routing {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
                     max_output_tokens: None,
@@ -2038,6 +2040,7 @@ mod bypass_instance_cap_tests {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
                     max_output_tokens: None,
@@ -2169,7 +2172,8 @@ mod cli_tool_use_persistence {
     use ao_process::mock::{MockProcessSupervisor, MockScenario};
     use ao_protocol::agent::{AgentProfile, OutputFormat, ProviderConfig};
 
-    fn make_profile(id: &str) -> AgentProfile {
+    // pub(super): the completed_empty_wiring module drives the same harness.
+    pub(super) fn make_profile(id: &str) -> AgentProfile {
         AgentProfile {
             id: id.to_string(),
             name: format!("agent {id}"),
@@ -2216,6 +2220,7 @@ mod cli_tool_use_persistence {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
                     max_output_tokens: None,
@@ -2431,6 +2436,7 @@ mod project_scope_prompt {
             persona: Some("PERSONA_SENTINEL collaborative reviewer".to_string()),
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
                     max_output_tokens: None,
@@ -3013,6 +3019,81 @@ fn merge_agy_mcp_config_is_idempotent_on_repeat_runs() {
     assert_eq!(parsed["mcpServers"]["launchpad"]["url"], url);
 }
 
+#[test]
+fn merge_droid_mcp_config_creates_file_when_absent() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let url = "http://localhost:3101/mcp/droid-agent/session-1";
+    merge_droid_mcp_config(tmp.path(), url).expect("write should succeed");
+
+    let config_path = tmp.path().join(".factory").join("mcp.json");
+    let raw = std::fs::read_to_string(&config_path).expect("config must exist");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    let entry = &parsed["mcpServers"]["launchpad"];
+    assert_eq!(entry["url"], url);
+    // droid's http transport wants an explicit type and oauth disabled —
+    // without `oauth: false` it attempts an OAuth discovery dance against
+    // launchpad's unauthenticated localhost endpoint.
+    assert_eq!(entry["type"], "http");
+    assert_eq!(entry["oauth"], false);
+}
+
+#[test]
+fn merge_droid_mcp_config_preserves_other_servers() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let factory_dir = tmp.path().join(".factory");
+    std::fs::create_dir_all(&factory_dir).expect("mkdir");
+    std::fs::write(
+        factory_dir.join("mcp.json"),
+        r#"{"mcpServers":{"other-server":{"type":"http","url":"https://mcp.example.com/mcp"}}}"#,
+    )
+    .expect("seed file");
+
+    let url = "http://localhost:3101/mcp/droid-agent/session-2";
+    merge_droid_mcp_config(tmp.path(), url).expect("write should succeed");
+
+    let raw = std::fs::read_to_string(factory_dir.join("mcp.json")).expect("read back");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(
+        parsed["mcpServers"]["other-server"]["url"], "https://mcp.example.com/mcp",
+        "pre-existing project MCP servers must survive the merge"
+    );
+    assert_eq!(parsed["mcpServers"]["launchpad"]["url"], url);
+}
+
+#[test]
+fn merge_droid_mcp_config_overwrites_stale_launchpad_url() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let old_url = "http://localhost:3101/mcp/droid-agent/session-old";
+    merge_droid_mcp_config(tmp.path(), old_url).expect("first write");
+
+    let new_url = "http://localhost:3101/mcp/droid-agent/session-new";
+    merge_droid_mcp_config(tmp.path(), new_url).expect("second write");
+
+    let raw = std::fs::read_to_string(tmp.path().join(".factory").join("mcp.json"))
+        .expect("read back");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(
+        parsed["mcpServers"]["launchpad"]["url"], new_url,
+        "a later spawn's session URL must replace the previous one"
+    );
+}
+
+#[test]
+fn merge_droid_mcp_config_handles_malformed_file_without_panicking() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let factory_dir = tmp.path().join(".factory");
+    std::fs::create_dir_all(&factory_dir).expect("mkdir");
+    std::fs::write(factory_dir.join("mcp.json"), "{not valid json at all").expect("seed malformed file");
+
+    let url = "http://localhost:3101/mcp/droid-agent/session-malformed";
+    merge_droid_mcp_config(tmp.path(), url)
+        .expect("malformed existing file must not fail the merge");
+
+    let raw = std::fs::read_to_string(factory_dir.join("mcp.json")).expect("read back");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(parsed["mcpServers"]["launchpad"]["url"], url);
+}
+
 /// `build_argv` provider-dispatch coverage: proves the `agy` addition
 /// doesn't perturb Claude/Codex/cursor-agent argv (byte-for-byte), and
 /// pins down the new `agy` argv shape.
@@ -3078,6 +3159,7 @@ mod build_argv_provider_dispatch {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
                     max_output_tokens: None,
@@ -3262,6 +3344,780 @@ mod build_argv_provider_dispatch {
             ],
             "agy must take neither --mcp-config nor a -c override (file-based, like cursor-agent), \
                  and its prompt must be preceded by -p"
+        );
+    }
+
+    #[test]
+    fn droid_argv_takes_no_mcp_argv_flag() {
+        let agent = make_agent(
+            "droid",
+            vec![
+                "exec",
+                "--output-format",
+                "stream-json",
+                "--skip-permissions-unsafe",
+            ],
+            Some("-m"),
+            OutputFormat::StreamJson,
+            "droid",
+            vec!["session_id"],
+        );
+        let (mcp_path, mcp_url) = mcp_args();
+        let argv = CliAgentRunner::build_argv(&agent, "hello", Some(&mcp_path), Some(mcp_url));
+        assert_eq!(
+            argv,
+            vec![
+                "droid",
+                "exec",
+                "--output-format",
+                "stream-json",
+                "--skip-permissions-unsafe",
+                "-m",
+                "test-model",
+                "hello",
+            ],
+            "droid exits 2 on unrecognized flags: no --mcp-config and no -c override — \
+             MCP delivery is the .factory/mcp.json file written by the run loop"
+        );
+    }
+
+    #[test]
+    fn droid_argv_appends_system_prompt_via_append_flag() {
+        let mut agent = make_agent(
+            "droid",
+            vec![
+                "exec",
+                "--output-format",
+                "stream-json",
+                "--skip-permissions-unsafe",
+            ],
+            Some("-m"),
+            OutputFormat::StreamJson,
+            "droid",
+            vec!["session_id"],
+        );
+        agent.system_prompt = Some("You are terse.".to_string());
+        if let ProviderConfig::Cli(ref mut cli) = agent.provider {
+            cli.system_prompt_arg = Some("--append-system-prompt".to_string());
+        }
+        let argv = CliAgentRunner::build_argv(&agent, "hello", None, None);
+        assert_eq!(
+            argv,
+            vec![
+                "droid",
+                "exec",
+                "--output-format",
+                "stream-json",
+                "--skip-permissions-unsafe",
+                "-m",
+                "test-model",
+                "--append-system-prompt",
+                "You are terse.",
+                "hello",
+            ],
+            "droid has no full-replacement system-prompt flag; --append-system-prompt is the persona channel"
+        );
+    }
+}
+
+#[test]
+fn materialize_droid_factory_home_copies_auth_and_settings_only() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let real = tmp.path().join("real").join(".factory");
+    std::fs::create_dir_all(&real).expect("mkdir real home");
+    std::fs::write(real.join("auth.v2.file"), "token").expect("seed auth");
+    std::fs::write(real.join("auth.v2.key"), "key").expect("seed key");
+    std::fs::write(real.join("settings.json"), "{}").expect("seed settings");
+    // The whole point of the minimal home: the user's MCP roster must NOT
+    // come along, or droid pays the connection cost every spawn.
+    std::fs::write(real.join("mcp.json"), r#"{"mcpServers":{"slow":{}}}"#).expect("seed mcp");
+    std::fs::write(real.join("droid-log-single.log"), "noise").expect("seed log");
+    let agent_home = tmp.path().join("agent-home");
+
+    let value =
+        materialize_droid_factory_home(&real, &agent_home).expect("materialize should succeed");
+
+    let expected_home = agent_home.join("factory-home");
+    assert_eq!(value, expected_home.to_string_lossy());
+    let factory_dir = expected_home.join(".factory");
+    assert_eq!(
+        std::fs::read_to_string(factory_dir.join("auth.v2.file")).expect("auth copied"),
+        "token"
+    );
+    assert_eq!(
+        std::fs::read_to_string(factory_dir.join("auth.v2.key")).expect("key copied"),
+        "key"
+    );
+    assert_eq!(
+        std::fs::read_to_string(factory_dir.join("settings.json")).expect("settings copied"),
+        "{}"
+    );
+    assert!(
+        !factory_dir.join("mcp.json").exists(),
+        "the user-level MCP roster must stay out of the minimal home"
+    );
+    assert!(
+        !factory_dir.join("droid-log-single.log").exists(),
+        "unrelated files must stay out of the minimal home"
+    );
+}
+
+#[test]
+fn materialize_droid_factory_home_refreshes_stale_auth() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let real = tmp.path().join("real").join(".factory");
+    std::fs::create_dir_all(&real).expect("mkdir real home");
+    std::fs::write(real.join("auth.v2.file"), "old-token").expect("seed auth");
+    let agent_home = tmp.path().join("agent-home");
+
+    materialize_droid_factory_home(&real, &agent_home).expect("first materialize");
+    let dest = agent_home
+        .join("factory-home")
+        .join(".factory")
+        .join("auth.v2.file");
+    assert_eq!(
+        std::fs::read_to_string(&dest).expect("copied"),
+        "old-token"
+    );
+
+    // Simulate droid refreshing its credentials in the real home. The
+    // rewrite happens strictly after the copy above, so the source's mtime
+    // is newer without any timestamp games.
+    std::fs::write(real.join("auth.v2.file"), "new-token").expect("rotate token");
+
+    materialize_droid_factory_home(&real, &agent_home).expect("second materialize");
+    assert_eq!(
+        std::fs::read_to_string(&dest).expect("re-copied"),
+        "new-token",
+        "a newer auth file in the real home must replace the stale copy"
+    );
+}
+
+#[test]
+fn cli_session_store_roundtrip_and_remove() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let home = tmp.path();
+
+    assert_eq!(load_cli_session_id(home, "droid:default"), None);
+
+    store_cli_session_id(home, "droid:default", Some("sess-1")).expect("store");
+    store_cli_session_id(home, "droid:thread-a", Some("sess-2")).expect("store");
+    assert_eq!(
+        load_cli_session_id(home, "droid:default").as_deref(),
+        Some("sess-1")
+    );
+    assert_eq!(
+        load_cli_session_id(home, "droid:thread-a").as_deref(),
+        Some("sess-2"),
+        "a second thread's id must not clobber the first"
+    );
+
+    store_cli_session_id(home, "droid:default", Some("sess-3")).expect("overwrite");
+    assert_eq!(
+        load_cli_session_id(home, "droid:default").as_deref(),
+        Some("sess-3")
+    );
+
+    store_cli_session_id(home, "droid:default", None).expect("clear");
+    assert_eq!(load_cli_session_id(home, "droid:default"), None);
+    assert_eq!(
+        load_cli_session_id(home, "droid:thread-a").as_deref(),
+        Some("sess-2"),
+        "clearing one key must not touch the others"
+    );
+}
+
+#[test]
+fn cli_session_store_tolerates_malformed_file() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(tmp.path().join("cli-sessions.json"), "{nope").expect("seed malformed");
+    assert_eq!(load_cli_session_id(tmp.path(), "droid:default"), None);
+    store_cli_session_id(tmp.path(), "droid:default", Some("sess-9")).expect("rebuild");
+    assert_eq!(
+        load_cli_session_id(tmp.path(), "droid:default").as_deref(),
+        Some("sess-9")
+    );
+}
+
+#[test]
+fn cli_session_store_reads_legacy_bare_string_format() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("cli-sessions.json"),
+        r#"{"sessions": {"droid:default": "sess-legacy"}}"#,
+    )
+    .expect("seed legacy");
+    assert_eq!(
+        load_cli_session_id(tmp.path(), "droid:default").as_deref(),
+        Some("sess-legacy")
+    );
+}
+
+#[test]
+fn cli_session_resume_cap_forces_fresh_session_after_max_turns() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let home = tmp.path();
+
+    // Same id re-stored = a resumed turn; the counter climbs.
+    store_cli_session_id(home, "droid:default", Some("sess-1")).expect("store");
+    for _ in 0..CLI_SESSION_MAX_RESUME_TURNS {
+        store_cli_session_id(home, "droid:default", Some("sess-1")).expect("restore");
+    }
+    // At the cap the loader refuses the id — the next turn starts fresh…
+    assert_eq!(load_cli_session_id(home, "droid:default"), None);
+
+    // …and that fresh turn's new id stores with a reset counter, so resume
+    // works again right away.
+    store_cli_session_id(home, "droid:default", Some("sess-2")).expect("store new");
+    assert_eq!(
+        load_cli_session_id(home, "droid:default").as_deref(),
+        Some("sess-2")
+    );
+
+    // A new id mid-life also resets the counter (a provider that mints a
+    // fresh session id on resume must not inherit the old one's age).
+    for _ in 0..CLI_SESSION_MAX_RESUME_TURNS {
+        store_cli_session_id(home, "droid:default", Some("sess-2")).expect("restore");
+    }
+    store_cli_session_id(home, "droid:default", Some("sess-3")).expect("new id");
+    assert_eq!(
+        load_cli_session_id(home, "droid:default").as_deref(),
+        Some("sess-3")
+    );
+}
+
+#[test]
+fn cli_session_byte_cap_forces_fresh_session_for_fat_session_file() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let home = tmp.path();
+    store_cli_session_id(home, "droid:default", Some("sess-fat")).expect("store");
+    // A session file just over the byte cap under some droid cwd-slug dir.
+    let slug_dir = home
+        .join("factory-home")
+        .join(".factory")
+        .join("sessions")
+        .join("-private-tmp-lp-x");
+    std::fs::create_dir_all(&slug_dir).expect("mkdir slug dir");
+    std::fs::write(
+        slug_dir.join("sess-fat.jsonl"),
+        vec![b'x'; (CLI_SESSION_MAX_RESUME_BYTES + 1) as usize],
+    )
+    .expect("write fat session");
+    assert_eq!(
+        load_cli_session_id(home, "droid:default"),
+        None,
+        "a session file over the byte cap must not be resumed"
+    );
+}
+
+#[test]
+fn cli_session_under_byte_cap_still_resumes() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let home = tmp.path();
+    store_cli_session_id(home, "droid:default", Some("sess-slim")).expect("store");
+    let slug_dir = home
+        .join("factory-home")
+        .join(".factory")
+        .join("sessions")
+        .join("-private-tmp-lp-x");
+    std::fs::create_dir_all(&slug_dir).expect("mkdir slug dir");
+    std::fs::write(slug_dir.join("sess-slim.jsonl"), b"{}\n").expect("write slim session");
+    assert_eq!(
+        load_cli_session_id(home, "droid:default").as_deref(),
+        Some("sess-slim")
+    );
+}
+
+#[test]
+fn cli_session_missing_file_keeps_returning_the_stored_id() {
+    // No session file on disk (e.g. droid fell back to the user's default
+    // Factory home, so files don't live under the agent home): the loader
+    // returns the id as before and leaves stale-id handling to the exit-code
+    // classification, which clears the pointer on a failed resume.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    store_cli_session_id(tmp.path(), "droid:default", Some("sess-gone")).expect("store");
+    assert_eq!(
+        load_cli_session_id(tmp.path(), "droid:default").as_deref(),
+        Some("sess-gone")
+    );
+}
+
+#[test]
+fn cli_session_file_size_finds_sessions_in_any_slug_dir() {
+    // The cwd-slug level is droid-side mangling; a session created under one
+    // cwd must still be found (and byte-capped) when later runs scan the
+    // sessions root.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let home = tmp.path();
+    store_cli_session_id(home, "droid:default", Some("sess-roam")).expect("store");
+    let slug_dir = home
+        .join("factory-home")
+        .join(".factory")
+        .join("sessions")
+        .join("-some-other-cwd");
+    std::fs::create_dir_all(&slug_dir).expect("mkdir slug dir");
+    std::fs::write(
+        slug_dir.join("sess-roam.jsonl"),
+        vec![b'x'; (CLI_SESSION_MAX_RESUME_BYTES + 1) as usize],
+    )
+    .expect("write fat session");
+    assert_eq!(load_cli_session_id(home, "droid:default"), None);
+}
+
+#[test]
+fn cli_session_byte_cap_fresh_session_resets_turn_counter() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let home = tmp.path();
+    // Age the old id so its counter is nonzero, and give it a fat file.
+    store_cli_session_id(home, "droid:default", Some("sess-old")).expect("store");
+    store_cli_session_id(home, "droid:default", Some("sess-old")).expect("restore");
+    let slug_dir = home
+        .join("factory-home")
+        .join(".factory")
+        .join("sessions")
+        .join("-private-tmp-lp-x");
+    std::fs::create_dir_all(&slug_dir).expect("mkdir slug dir");
+    std::fs::write(
+        slug_dir.join("sess-old.jsonl"),
+        vec![b'x'; (CLI_SESSION_MAX_RESUME_BYTES + 1) as usize],
+    )
+    .expect("write fat session");
+    // The byte cap refuses the fat id…
+    assert_eq!(load_cli_session_id(home, "droid:default"), None);
+    // …the fresh turn's new id stores with a reset counter…
+    store_cli_session_id(home, "droid:default", Some("sess-new")).expect("store new");
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.join("cli-sessions.json")).expect("read store"),
+    )
+    .expect("parse store");
+    assert_eq!(
+        raw["sessions"]["droid:default"],
+        serde_json::json!({ "id": "sess-new", "turns": 0 })
+    );
+    // …and resumes right away (no file on disk = unknown size = resumable).
+    assert_eq!(
+        load_cli_session_id(home, "droid:default").as_deref(),
+        Some("sess-new")
+    );
+}
+
+#[test]
+fn cli_session_byte_cap_applies_to_legacy_bare_string_entries() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let home = tmp.path();
+    std::fs::write(
+        home.join("cli-sessions.json"),
+        r#"{"sessions": {"droid:default": "sess-legacy-fat"}}"#,
+    )
+    .expect("seed legacy store");
+    let slug_dir = home
+        .join("factory-home")
+        .join(".factory")
+        .join("sessions")
+        .join("-private-tmp-lp-x");
+    std::fs::create_dir_all(&slug_dir).expect("mkdir slug dir");
+    std::fs::write(
+        slug_dir.join("sess-legacy-fat.jsonl"),
+        vec![b'x'; (CLI_SESSION_MAX_RESUME_BYTES + 1) as usize],
+    )
+    .expect("write fat session");
+    assert_eq!(
+        load_cli_session_id(home, "droid:default"),
+        None,
+        "legacy bare-string entries must be byte-capped too"
+    );
+}
+
+#[test]
+fn apply_session_arg_keeps_prompt_last_for_arg_mode() {
+    let mut argv: Vec<String> = ["droid", "exec", "--auto", "low", "hello"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    apply_session_arg(&mut argv, "-s", "sess-1", &InputMode::Arg);
+    assert_eq!(
+        argv,
+        vec!["droid", "exec", "--auto", "low", "-s", "sess-1", "hello"],
+        "the prompt is the first free argument; the session pair must not displace it"
+    );
+}
+
+#[test]
+fn classify_end_reason_treats_nonzero_natural_exit_as_error() {
+    use ao_process::supervisor::TerminationReason as TR;
+    // The supervisor reports "Natural" for ANY self-exit — only exit 0 is a
+    // success. A nonzero exit must classify as Error so the run clears the
+    // stored session id (stale-id wedge) and the silent-failure bubble fires.
+    assert!(matches!(
+        classify_end_reason(TR::Natural, Some(0)),
+        RunEndReason::Completed
+    ));
+    assert!(matches!(
+        classify_end_reason(TR::Natural, Some(1)),
+        RunEndReason::Error
+    ));
+    assert!(matches!(
+        classify_end_reason(TR::Natural, Some(2)),
+        RunEndReason::Error
+    ));
+    // Signal kill on unix surfaces as None — also a failure.
+    assert!(matches!(
+        classify_end_reason(TR::Natural, None),
+        RunEndReason::Error
+    ));
+    // The other reasons pass through unchanged.
+    assert!(matches!(
+        classify_end_reason(TR::Cancelled, None),
+        RunEndReason::Cancelled
+    ));
+    assert!(matches!(
+        classify_end_reason(TR::Timeout, None),
+        RunEndReason::TimedOut
+    ));
+    assert!(matches!(
+        classify_end_reason(TR::NoOutputTimeout, None),
+        RunEndReason::NoOutputTimeout
+    ));
+    assert!(matches!(
+        classify_end_reason(TR::Error, None),
+        RunEndReason::Error
+    ));
+}
+
+#[test]
+fn reclassify_empty_completion_flags_exit0_with_nothing_visible() {
+    // The production case: gateway returned empty completions, the CLI
+    // retried internally, gave up, exited 0 with no events — a failure
+    // wearing a success code.
+    assert!(matches!(
+        reclassify_empty_completion(RunEndReason::Completed, false, false, false),
+        RunEndReason::CompletedEmpty
+    ));
+    // A terminal TextComplete flush is a real reply.
+    assert!(matches!(
+        reclassify_empty_completion(RunEndReason::Completed, true, false, false),
+        RunEndReason::Completed
+    ));
+    // Tool-only turn: no text, but visible tool activity — a legitimate
+    // turn, not an empty reply.
+    assert!(matches!(
+        reclassify_empty_completion(RunEndReason::Completed, false, true, false),
+        RunEndReason::Completed
+    ));
+    // A bare `<task action="complete">` turn produces no text by design
+    // (suppressed), and in buffered Json output modes nothing streams — the
+    // dispatched terminal action is the only evidence the turn did its job.
+    assert!(matches!(
+        reclassify_empty_completion(RunEndReason::Completed, false, false, true),
+        RunEndReason::Completed
+    ));
+    // Non-Completed reasons pass through untouched — a cancellation or
+    // timeout is already classified honestly.
+    for reason in [
+        RunEndReason::Cancelled,
+        RunEndReason::TimedOut,
+        RunEndReason::NoOutputTimeout,
+        RunEndReason::Error,
+        RunEndReason::TurnLimitReached,
+    ] {
+        assert_eq!(reclassify_empty_completion(reason, false, false, false), reason);
+    }
+}
+
+#[test]
+fn apply_session_arg_appends_for_stdin_mode() {
+    let mut argv: Vec<String> = ["droid", "exec"].iter().map(|s| s.to_string()).collect();
+    apply_session_arg(&mut argv, "-s", "sess-1", &InputMode::Stdin);
+    assert_eq!(argv, vec!["droid", "exec", "-s", "sess-1"]);
+}
+
+#[test]
+fn gitignore_droid_mcp_config_appends_once_and_only_in_git_repos() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+
+    // Not a git repo: untouched.
+    gitignore_droid_mcp_config(tmp.path());
+    assert!(!tmp.path().join(".gitignore").exists());
+
+    // Git repo without a .gitignore: entry created (root-anchored form).
+    std::fs::create_dir(tmp.path().join(".git")).expect("mkdir .git");
+    gitignore_droid_mcp_config(tmp.path());
+    let content = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
+    assert!(content.lines().any(|l| l == "/.factory/mcp.json"));
+
+    // Idempotent: a second run adds nothing.
+    gitignore_droid_mcp_config(tmp.path());
+    let again = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
+    assert_eq!(content, again);
+
+    // Spawn cwd a SUBDIRECTORY of the repo: the rule lands at the repo root
+    // with the relative prefix, not in the subdirectory.
+    let sub = tmp.path().join("crates/app");
+    std::fs::create_dir_all(&sub).expect("mkdir subdir");
+    gitignore_droid_mcp_config(&sub);
+    let rooted = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
+    assert!(
+        rooted.lines().any(|l| l == "/crates/app/.factory/mcp.json"),
+        "rooted: {rooted}"
+    );
+    assert!(!sub.join(".gitignore").exists());
+
+    // Existing content without trailing newline stays intact, entry appended.
+    let tmp2 = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir(tmp2.path().join(".git")).expect("mkdir .git");
+    std::fs::write(tmp2.path().join(".gitignore"), "target/").expect("seed");
+    gitignore_droid_mcp_config(tmp2.path());
+    let content2 = std::fs::read_to_string(tmp2.path().join(".gitignore")).expect("gitignore");
+    assert!(content2.starts_with("target/\n"));
+    assert!(content2.lines().any(|l| l == "/.factory/mcp.json"));
+
+    // A broader `.factory` ignore already covers it — no new entry.
+    let tmp3 = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir(tmp3.path().join(".git")).expect("mkdir .git");
+    std::fs::write(tmp3.path().join(".gitignore"), ".factory/\n").expect("seed");
+    gitignore_droid_mcp_config(tmp3.path());
+    assert_eq!(
+        std::fs::read_to_string(tmp3.path().join(".gitignore")).expect("gitignore"),
+        ".factory/\n"
+    );
+}
+
+#[test]
+fn materialize_droid_factory_home_tolerates_missing_auth_files() {
+    // A user who has run droid but whose home only has some of the expected
+    // files (or none — pre-login) still gets a usable minimal home.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let real = tmp.path().join("real").join(".factory");
+    std::fs::create_dir_all(&real).expect("mkdir real home");
+    let agent_home = tmp.path().join("agent-home");
+
+    let value =
+        materialize_droid_factory_home(&real, &agent_home).expect("materialize should succeed");
+
+    let factory_dir = agent_home.join("factory-home").join(".factory");
+    assert!(factory_dir.is_dir(), "minimal .factory dir must exist");
+    assert!(!value.is_empty());
+    assert!(
+        !factory_dir.join("settings.json").exists(),
+        "missing optional files are skipped, not errors"
+    );
+}
+
+// === CompletedEmpty end-to-end wiring (regression) ===
+//
+// The pure-helper test above proves the truth table; this one proves the
+// WIRING — that a real `CliAgentRunner::run` driving the droid normalizer
+// through a silent exit-0 (the flaky-gateway failure observed in
+// production: the CLI retried internally, gave up, exited 0 with no
+// stream events at all) actually ends as `RunEnded{CompletedEmpty}` and
+// raises the silent-failure bubble, instead of reporting `Completed`.
+mod completed_empty_wiring {
+    use super::cli_tool_use_persistence::make_profile;
+    use super::*;
+    use ao_normalizer::registry::NormalizerRegistry;
+    use ao_persistence::PersistenceLayer;
+    use ao_process::mock::{MockProcessSupervisor, MockScenario};
+    use ao_protocol::event::AgentEventPayload;
+
+    #[tokio::test]
+    async fn silent_exit0_classifies_completed_empty_and_raises_the_bubble() {
+        let _guard = crate::plugin_paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().expect("temp dir");
+        std::env::set_var("LAUNCHPAD_STUDIO_DATA_DIR", tmp.path());
+        let persistence = Arc::new(PersistenceLayer::init().await.expect("persistence init"));
+
+        // No stdout lines at all — the process exits 0 having emitted
+        // nothing, exactly the gateway-returned-empty shape.
+        let supervisor: Arc<dyn ProcessSupervisor> =
+            Arc::new(MockProcessSupervisor::new(vec![MockScenario {
+                stdout_lines: vec![],
+                stderr_lines: vec![],
+                exit_code: 0,
+                delay_per_line_ms: 0,
+            }]));
+
+        let event_bus = Arc::new(EventBus::new(64));
+        let mut bus_rx = event_bus.subscribe();
+        let runner = Arc::new(CliAgentRunner::new(
+            supervisor,
+            Arc::new(NormalizerRegistry::new()),
+            Arc::clone(&event_bus),
+            Arc::clone(&persistence),
+            Arc::new(CommandQueue::new()),
+            Arc::new(InstanceRegistry::new()),
+            Arc::new(crate::agent_runner::RunningAgents::new()),
+            Arc::new(Registry::new()),
+        ));
+
+        let mut profile = make_profile("silent-agent");
+        // Drive the droid normalizer (the production CLI this failure was
+        // observed with) rather than the claude one the helper defaults to.
+        if let ao_protocol::agent::ProviderConfig::Cli(cfg) = &mut profile.provider {
+            cfg.command = "droid".to_string();
+            cfg.normalizer = Some("droid".to_string());
+        }
+        persistence.agents.create(&profile).await.expect("create agent");
+
+        let (tx, mut rx) = mpsc::channel(1);
+        runner
+            .run(&profile, "check my mail", &[], tx, None)
+            .await
+            .expect("run must start");
+
+        let complete = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("run must finish within timeout")
+            .expect("completion must arrive");
+        assert_eq!(
+            complete.end_reason,
+            RunEndReason::CompletedEmpty,
+            "exit 0 with zero visible output must not report Completed"
+        );
+
+        // Collect everything the bus saw for this run.
+        let mut saw_run_ended_empty = false;
+        let mut saw_bubble = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            match &event.payload {
+                AgentEventPayload::RunEnded { reason } => {
+                    saw_run_ended_empty |= *reason == RunEndReason::CompletedEmpty;
+                }
+                AgentEventPayload::Error { message, recoverable } => {
+                    saw_bubble |= *recoverable && message.contains("empty reply");
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_run_ended_empty, "RunEnded must carry CompletedEmpty");
+        assert!(
+            saw_bubble,
+            "the silent-failure bubble must fire — an interactive user must not watch the agent go quietly dark"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_only_turn_stays_completed() {
+        let _guard = crate::plugin_paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().expect("temp dir");
+        std::env::set_var("LAUNCHPAD_STUDIO_DATA_DIR", tmp.path());
+        let persistence = Arc::new(PersistenceLayer::init().await.expect("persistence init"));
+
+        // A droid stream-json turn that runs a tool and says nothing —
+        // legitimate, must NOT be reclassified. Newline-terminated, as the
+        // real stream is (unterminated tails are only parsed at finalize —
+        // the finalize-loop coverage is what the silent test's sibling
+        // scenario exercises).
+        let stdout_lines = vec![
+            r#"{"type":"tool_call","id":"call-1","toolName":"Bash","parameters":{"command":"ls"}}"#.to_string(),
+            r#"{"type":"tool_result","id":"call-1","value":"ok"}"#.to_string(),
+            r#"{"type":"completion","usage":{"inputTokens":1,"outputTokens":1}}"#.to_string(),
+        ]
+        .into_iter()
+        .map(|l| format!("{l}\n"))
+        .collect();
+        let supervisor: Arc<dyn ProcessSupervisor> =
+            Arc::new(MockProcessSupervisor::new(vec![MockScenario {
+                stdout_lines,
+                stderr_lines: vec![],
+                exit_code: 0,
+                delay_per_line_ms: 0,
+            }]));
+
+        let runner = Arc::new(CliAgentRunner::new(
+            supervisor,
+            Arc::new(NormalizerRegistry::new()),
+            Arc::new(EventBus::new(64)),
+            Arc::clone(&persistence),
+            Arc::new(CommandQueue::new()),
+            Arc::new(InstanceRegistry::new()),
+            Arc::new(crate::agent_runner::RunningAgents::new()),
+            Arc::new(Registry::new()),
+        ));
+
+        let mut profile = make_profile("tool-only-agent");
+        if let ao_protocol::agent::ProviderConfig::Cli(cfg) = &mut profile.provider {
+            cfg.command = "droid".to_string();
+            cfg.normalizer = Some("droid".to_string());
+        }
+        persistence.agents.create(&profile).await.expect("create agent");
+
+        let (tx, mut rx) = mpsc::channel(1);
+        runner
+            .run(&profile, "list files", &[], tx, None)
+            .await
+            .expect("run must start");
+
+        let complete = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("run must finish within timeout")
+            .expect("completion must arrive");
+        assert_eq!(
+            complete.end_reason,
+            RunEndReason::Completed,
+            "a tool-only turn is a legitimate turn, not an empty reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn unterminated_final_tool_line_still_counts_via_finalize() {
+        let _guard = crate::plugin_paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().expect("temp dir");
+        std::env::set_var("LAUNCHPAD_STUDIO_DATA_DIR", tmp.path());
+        let persistence = Arc::new(PersistenceLayer::init().await.expect("persistence init"));
+
+        // One tool_call, NO trailing newline: the streaming loop never sees
+        // a complete line, so only normalizer.finalize() parses it. If the
+        // finalize-payload loop didn't track visible output, this turn
+        // would misclassify as CompletedEmpty.
+        let supervisor: Arc<dyn ProcessSupervisor> =
+            Arc::new(MockProcessSupervisor::new(vec![MockScenario {
+                stdout_lines: vec![
+                    r#"{"type":"tool_call","id":"call-9","toolName":"Bash","parameters":{}}"#
+                        .to_string(),
+                ],
+                stderr_lines: vec![],
+                exit_code: 0,
+                delay_per_line_ms: 0,
+            }]));
+
+        let runner = Arc::new(CliAgentRunner::new(
+            supervisor,
+            Arc::new(NormalizerRegistry::new()),
+            Arc::new(EventBus::new(64)),
+            Arc::clone(&persistence),
+            Arc::new(CommandQueue::new()),
+            Arc::new(InstanceRegistry::new()),
+            Arc::new(crate::agent_runner::RunningAgents::new()),
+            Arc::new(Registry::new()),
+        ));
+
+        let mut profile = make_profile("unterminated-line-agent");
+        if let ao_protocol::agent::ProviderConfig::Cli(cfg) = &mut profile.provider {
+            cfg.command = "droid".to_string();
+            cfg.normalizer = Some("droid".to_string());
+        }
+        persistence.agents.create(&profile).await.expect("create agent");
+
+        let (tx, mut rx) = mpsc::channel(1);
+        runner
+            .run(&profile, "list files", &[], tx, None)
+            .await
+            .expect("run must start");
+
+        let complete = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("run must finish within timeout")
+            .expect("completion must arrive");
+        assert_eq!(
+            complete.end_reason,
+            RunEndReason::Completed,
+            "a final line parsed only at finalize must still count as output"
         );
     }
 }

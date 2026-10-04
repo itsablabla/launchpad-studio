@@ -209,6 +209,7 @@ async fn create_agent(
             .and_then(|v| v.as_str())
             .map(str::to_string),
         legacy_system_prompt: None,
+        minimal_prompt: None,
         max_delegation_depth: None,
         channels: vec![],
     };
@@ -554,6 +555,44 @@ fn template_provider(template: &str) -> Option<CliProviderConfig> {
             session_id_fields: vec!["conversation_id".to_string()],
             clear_env: false,
             no_output_timeout_ms: 30000,
+            file_capabilities: None,
+        }),
+        // Factory Droid (`droid exec`). MCP delivery is file-based
+        // (`.factory/mcp.json` in the spawn cwd) and droid exits 2 on
+        // unrecognized flags — the argv wiring for both lives in
+        // `CliAgentRunner::build_argv` (`ao-engine`), gated on the `droid`
+        // command basename. `--skip-permissions-unsafe` runs every tool
+        // without confirmation — the only mode that works for an unattended
+        // chat agent, since a lower autonomy level can stall a run on an
+        // approval nobody can grant. Users wanting a read-only agent can drop
+        // to `--auto low` in Advanced settings.
+        // session_arg "-s" resumes the droid session captured from the
+        // previous turn's stream (see `cli-sessions.json` handling in
+        // `ao-engine`), so follow-up messages continue the conversation.
+        // no_output_timeout_ms is 90s, not the usual 30s: droid prints
+        // nothing until its MCP servers connect (verified empirically — a
+        // 30s watchdog killed the first run before the init event arrived);
+        // the per-agent Factory home keeps that to one server, so 90s is
+        // generous.
+        "droid" => Some(CliProviderConfig {
+            command: "droid".to_string(),
+            args: vec![
+                "exec".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--skip-permissions-unsafe".to_string(),
+            ],
+            normalizer: Some("droid".to_string()),
+            output_format: OutputFormat::StreamJson,
+            input_mode: InputMode::Arg,
+            model_arg: Some("-m".to_string()),
+            model_aliases: HashMap::new(),
+            system_prompt_arg: Some("--append-system-prompt".to_string()),
+            session_arg: Some("-s".to_string()),
+            resume_args: Vec::new(),
+            session_id_fields: vec!["session_id".to_string()],
+            clear_env: false,
+            no_output_timeout_ms: 90000,
             file_capabilities: None,
         }),
         _ => None,

@@ -283,17 +283,51 @@ fn random_agent_emoji() -> &'static str {
 }
 
 fn copy_dir_recursive_sync(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_dir_recursive_from(src, dst, src)
+}
+
+fn copy_dir_recursive_from(src: &Path, dst: &Path, root: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let from = entry.path();
+        if skip_on_clone(root, &from) {
+            continue;
+        }
         let to = dst.join(entry.file_name());
         if file_type.is_dir() {
-            copy_dir_recursive_sync(&from, &to)?;
+            copy_dir_recursive_from(&from, &to, root)?;
         } else {
             std::fs::copy(&from, &to)?;
         }
     }
     Ok(())
+}
+
+/// CLI session state must not cross a clone. A clone that inherited
+/// `cli-sessions.json` would pass every resume guard (the copied droid
+/// session files exist and are small) and splice the PARENT's session id
+/// into its first run — two agents diverging from one shared provider
+/// conversation. Auth material (`factory-home/.factory/auth.v2*`,
+/// `settings.json`) still copies so the clone stays logged in. The path
+/// literals mirror `droid_factory_home_dir`/`cli_sessions_path` in
+/// `ao-engine/src/agent_runner/cli.rs` — ao-persistence can't import from
+/// the engine, so keep the two in sync by hand.
+fn skip_on_clone(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    // Crash leftovers of the atomic store write — session-state residue
+    // that must not cross the boundary either.
+    if rel.parent() == Some(Path::new(""))
+        && rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".cli-sessions.tmp-"))
+    {
+        return true;
+    }
+    rel == Path::new("cli-sessions.json")
+        || rel.starts_with("factory-home/.factory/sessions")
 }

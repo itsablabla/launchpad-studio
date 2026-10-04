@@ -19,6 +19,7 @@ import * as api from "../lib/api";
 import type { CreateAssignmentRequest, PatchAssignmentRequest, TriggerAssignmentRequest } from "../lib/api";
 import { useReadStatusStore } from "./readStatusStore";
 import { useArtifactStore } from "./artifactStore";
+import { isToolRowSkipped, type ToolCallRecord } from "../components/chat/toolCallLabel";
 export type { AgentProfile };
 
 const PAGE_SIZE = 50;
@@ -39,6 +40,12 @@ export const MAX_CACHED_CONVERSATIONS = 40;
  *  bubble visually continuous across that boundary. */
 const IN_FLIGHT_TEARDOWN_DELAY_MS = 400;
 
+/** Cap on a tool call's output as stored on the turn's in-flight entry —
+ *  a `Execute`/`Bash` call can return a whole test log, and the record lives
+ *  in memory (and on the finalized message's metadata stamp) for the rest of
+ *  the session. ToolCallGroup truncates further for display. */
+const TOOL_OUTPUT_STORE_MAX_CHARS = 200_000;
+
 /** Upper bound the optimistic typing indicator can spin before we assume the
  *  run never actually started. `sendMessage` shows the dots the instant a
  *  message is posted (rather than waiting for the server's RunStarted to
@@ -58,6 +65,13 @@ export type ActiveToolCall = {
   startedAt: number;
   action_id?: string;
   label?: string;
+  /** The provider's per-call id (droid/claude CLI normalizers thread it
+   *  through `ToolCallStarted`/`ToolCallCompleted`). When present,
+   *  `markInFlightToolCallDone` matches the completion to THIS chip by id
+   *  instead of the FIFO fallback — parallel tool calls complete out of
+   *  order, and the id is the only thing keeping each call's output attached
+   *  to the right transcript row. Also carried onto the `ToolCallRecord`. */
+  tool_use_id?: string;
   /** Set once a *classic* (native tool-calling, no `action_id`) chip's
    *  `tool_call_completed` has fired. The chip is intentionally NOT removed
    *  at that point (see `markInFlightToolCallDone`) — it keeps rendering
@@ -110,6 +124,17 @@ export interface InFlightAgentMessage {
    *  (see `finalizeInFlightText`) so the card survives the handoff from the
    *  streaming bubble to the persisted one. */
   artifactIds: string[];
+  /** Tool calls that have FINISHED this turn, in completion order — the live
+   *  half of the droid-TUI-style tool transcript (`ToolCallGroup`). A classic
+   *  chip moves here when its `tool_call_completed` arrives (instead of
+   *  lingering in `activeToolCalls` with `done: true`), so the bubble shows a
+   *  persistent collapsed row in place of the transient chip. Survives the
+   *  continuation runner's per-loop `run_ended` (only `activeToolCalls` is
+   *  cleared there) and resets with the entry itself (`deleteInFlight`).
+   *  Stamped onto the finalized message's `metadata.tool_calls` by
+   *  `finalizeInFlightText`, mirroring `artifactIds`. Optional so test
+   *  literals that don't care about it still type-check. */
+  completedToolCalls?: ToolCallRecord[];
   /** Sticky "has this turn shown anything yet" latch — true once text,
    *  a tool call, thinking, or an artifact has appeared at least once this
    *  turn. Lives here (not a component-local ref) so `StreamingMessage`
@@ -410,21 +435,19 @@ interface ChatState {
    *  (agent id, optionally thread-scoped). */
   syncRunArtifacts: (key: string) => void;
   setInFlightTyping: (agentId: string, typing: boolean) => void;
-  addInFlightToolCall: (agentId: string, toolCall: { tool: string; input?: Record<string, unknown>; label?: string }) => void;
-  /** Marks the oldest not-yet-done *classic* chip (no `action_id`) as done,
-   *  in place — it stays in `activeToolCalls` rather than being removed, so
-   *  the bubble doesn't shrink-then-regrow between one tool finishing and
-   *  the next starting or text beginning. Renamed from the old
-   *  `popInFlightToolCall`, which used to `slice(1)` the array on every
-   *  `tool_call_completed` — the FIFO/oldest-first assumption is carried
-   *  forward unchanged (`tool_call_completed` carries no id tying it back to
-   *  a specific chip, same as before; classic tool calls complete in
-   *  dispatch order in practice). Actual removal now only happens via
-   *  `text_delta`'s classic-chip flush, `finalizeInFlightText`, or
-   *  `clearInFlightToolCalls` (run_ended) — plus `capClassicToolCalls`
-   *  evicting the oldest once the stack exceeds
-   *  `MAX_STACKED_CLASSIC_TOOL_CALLS`. */
-  markInFlightToolCallDone: (agentId: string) => void;
+  addInFlightToolCall: (agentId: string, toolCall: { tool: string; input?: Record<string, unknown>; label?: string; toolUseId?: string }) => void;
+  /** Marks a *classic* (native tool-calling, no `action_id`) chip done and
+   *  moves it into `completedToolCalls` (the turn's persistent tool
+   *  transcript — rendered as a collapsed `ToolCallGroup` row in the same
+   *  bubble space, so the bubble doesn't shrink-then-regrow). Matching is by
+   *  `detail.toolUseId` when the provider threads one through (droid/claude
+   *  CLI do — parallel calls complete out of order, so FIFO would attach the
+   *  wrong output to a row); providers without ids fall back to the oldest
+   *  not-done chip (FIFO), the pre-id behavior. Actual removal paths are
+   *  unchanged: `text_delta`'s classic-chip flush, `finalizeInFlightText`,
+   *  `clearInFlightToolCalls` (run_ended), and `capClassicToolCalls`
+   *  eviction. `detail` also carries the completion's output/is_error. */
+  markInFlightToolCallDone: (agentId: string, detail?: { output?: string; isError?: boolean; toolUseId?: string }) => void;
   /** Append an artifact id produced by an `ArtifactWrite` tool call to the
    *  in-flight entry — the live half of inline card rendering. Idempotent
    *  (a duplicate id is a no-op) and immutably replaces the entry so
@@ -434,6 +457,12 @@ interface ChatState {
   addInFlightAgentAction: (agentId: string, actionId: string, label: string) => void;
   removeInFlightAgentAction: (agentId: string, actionId: string) => void;
   clearInFlightToolCalls: (agentId: string) => void;
+  /** Move still-open CLASSIC chips into the turn's persistent transcript
+   *  (salvage, same as `clearInFlightToolCalls`) while keeping `action_id`-keyed
+   *  chips — used when the first text delta lands, so a call that is still
+   *  running when the model starts talking isn't silently dropped from the
+   *  live transcript (its completion later patches the salvaged record by id). */
+  flushClassicToolCalls: (agentId: string) => void;
   /** Update the label on the first in-flight TodoCreate chip (from tool_progress events). */
   patchTodoCreateProgress: (agentId: string, label: string) => void;
   /** Open `panel` for `agentId` (mutually exclusive with the other three),
@@ -1390,6 +1419,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // retracts it if the run never actually starts.
     const flightKey = inFlightKey(selectedAgentId, sendThreadId);
     get().ensureInFlight(flightKey);
+    // A composer send always starts a NEW turn. If the previous turn ended
+    // badly (error/cancel — no text_complete, so no finalize reset) and its
+    // in-flight entry is still inside the 400ms teardown window, it can
+    // linger with salvaged completedToolCalls rows; without this reset the
+    // new turn would inherit (and eventually re-stamp) the dead turn's tool
+    // transcript. The engine-side continuation loop never goes through
+    // sendMessage, so clearing here can't clobber a mid-turn respawn.
+    set((state) => {
+      const entry = state.inFlightByAgent.get(flightKey);
+      if (!entry?.completedToolCalls?.length) return state;
+      const next = new Map(state.inFlightByAgent);
+      next.set(flightKey, { ...entry, completedToolCalls: undefined });
+      return { inFlightByAgent: next };
+    });
     armOptimisticTypingWatchdog(
       (k) => get().inFlightByAgent.get(k),
       (k) => get().deleteInFlight(k),
@@ -1431,6 +1474,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       next.set(agentId, {
         textBuffer: current?.textBuffer ?? "",
         activeToolCalls: current?.activeToolCalls ?? EMPTY_TOOL_CALLS,
+        completedToolCalls: current?.completedToolCalls,
         isTyping: true,
         startedAt: current?.startedAt ?? Date.now(),
         artifactIds: current?.artifactIds ?? EMPTY_ARTIFACT_IDS,
@@ -1466,6 +1510,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       next.set(agentId, {
         textBuffer: (current?.textBuffer ?? "") + text,
         activeToolCalls: current?.activeToolCalls ?? EMPTY_TOOL_CALLS,
+        // The turn's tool transcript survives text streaming — a tool call
+        // finishing right before the reply text starts must not lose its
+        // ToolCallGroup rows here (this rebuild used to drop the field).
+        completedToolCalls: current?.completedToolCalls,
         isTyping: true,
         startedAt: current?.startedAt ?? Date.now(),
         artifactIds: current?.artifactIds ?? EMPTY_ARTIFACT_IDS,
@@ -1496,12 +1544,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // buffer to the persisted transcript array. No dependency on turn_id or
     // a later refetch: this is the same id the live card already rendered.
     const finalizedArtifactIds = inFlightByAgent.get(key)?.artifactIds ?? EMPTY_ARTIFACT_IDS;
+    // Snapshot the turn's tool transcript the same way — completed rows plus
+    // any classic chips still open at finalize (treated as finished, no
+    // output known yet). Carried on `metadata.tool_calls`; on the next
+    // transcript refetch the same calls come back via server-side
+    // tool_use/tool_result pairing instead.
+    const inFlightEntry = inFlightByAgent.get(key);
+    const finalizedToolCalls: ToolCallRecord[] = [
+      ...(inFlightEntry?.completedToolCalls ?? []),
+      ...(inFlightEntry?.activeToolCalls ?? [])
+        .filter((tc) => tc.action_id == null && !isToolRowSkipped(tc.tool))
+        .map((tc) => ({
+          id: tc.tool_use_id,
+          tool: tc.tool,
+          input: tc.input,
+          elapsedMs: Math.max(0, Date.now() - tc.startedAt),
+        })),
+    ];
+    const finalMetadata: Record<string, unknown> = {};
+    if (finalizedArtifactIds.length > 0) finalMetadata.artifact_ids = finalizedArtifactIds;
+    if (finalizedToolCalls.length > 0) finalMetadata.tool_calls = finalizedToolCalls;
     const finalEntry: TranscriptEntry = {
       ts: new Date().toISOString(),
       role: { agent: agentId },
       content: text,
       event_type: "message",
-      ...(finalizedArtifactIds.length > 0 ? { metadata: { artifact_ids: finalizedArtifactIds } } : {}),
+      ...(Object.keys(finalMetadata).length > 0 ? { metadata: finalMetadata } : {}),
     };
 
     const onActiveThread = isEventForActiveThread(agentId, eventThreadId, threadsByAgent, selectedThreadIdByAgent);
@@ -1606,6 +1674,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       next.set(agentId, {
         textBuffer: current?.textBuffer ?? "",
         activeToolCalls: current?.activeToolCalls ?? EMPTY_TOOL_CALLS,
+        completedToolCalls: current?.completedToolCalls,
         isTyping: typing,
         startedAt: current?.startedAt ?? Date.now(),
         artifactIds: current?.artifactIds ?? EMPTY_ARTIFACT_IDS,
@@ -1619,7 +1688,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  addInFlightToolCall: (agentId: string, toolCall: { tool: string; input?: Record<string, unknown>; label?: string }) => {
+  addInFlightToolCall: (agentId: string, toolCall: { tool: string; input?: Record<string, unknown>; label?: string; toolUseId?: string }) => {
     set((state) => {
       const current = state.inFlightByAgent.get(agentId) ?? {
         textBuffer: "",
@@ -1629,16 +1698,39 @@ export const useChatStore = create<ChatState>((set, get) => ({
         artifactIds: EMPTY_ARTIFACT_IDS,
         ...EMPTY_THINKING,
       };
-      const withTs: ActiveToolCall = { ...toolCall, startedAt: Date.now() };
+      const withTs: ActiveToolCall = (() => {
+        // Destructure so the chip carries only `tool_use_id` — not both that
+        // and the camelCase source key from the spread.
+        const { toolUseId, ...rest } = toolCall;
+        return { ...rest, tool_use_id: toolUseId, startedAt: Date.now() };
+      })();
       let nextCalls = current.activeToolCalls;
-      if (toolCall.input) {
+      // Same-id restart (a repeated `tool_call_started` for a call already
+      // chipped) updates in place rather than stacking a duplicate row.
+      if (toolCall.toolUseId) {
+        const dupeIdx = current.activeToolCalls.findIndex(
+          (tc) => tc.action_id == null && !tc.done && tc.tool_use_id === toolCall.toolUseId
+        );
+        if (dupeIdx !== -1) {
+          const prev = current.activeToolCalls[dupeIdx];
+          nextCalls = [...current.activeToolCalls];
+          nextCalls[dupeIdx] = {
+            ...withTs,
+            startedAt: prev.startedAt,
+            input: withTs.input ?? prev.input,
+            label: withTs.label ?? prev.label,
+          };
+        }
+      }
+      if (nextCalls === current.activeToolCalls && toolCall.input) {
         for (let i = current.activeToolCalls.length - 1; i >= 0; i--) {
           const tc = current.activeToolCalls[i];
           // `!tc.done` excludes an already-finished chip from the merge — a
           // repeated call for the same tool (e.g. two separate `Read`s later
           // in the same turn) must not revive a completed chip's identity,
-          // it needs its own fresh entry.
-          if (tc.tool === toolCall.tool && !tc.input && !tc.done) {
+          // it needs its own fresh entry. Ids also must not collide: two
+          // calls the provider distinguished must stay distinct here too.
+          if (tc.tool === toolCall.tool && !tc.input && !tc.done && (!tc.tool_use_id || tc.tool_use_id === toolCall.toolUseId)) {
             nextCalls = [...current.activeToolCalls];
             // Carry a Layer-2 override label forward across the input-fill merge:
             // the input-bearing event's label wins, but if it has none we keep
@@ -1652,23 +1744,94 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (nextCalls === current.activeToolCalls) {
         nextCalls = [...current.activeToolCalls, withTs];
       }
-      nextCalls = capClassicToolCalls(nextCalls);
+      const capped = capClassicToolCalls(nextCalls);
+      // Salvage chips the cap evicted into the turn's persistent transcript —
+      // an over-cap turn (parallel tool bursts) must not lose rows. Skip-listed
+      // tools are excluded (their own rendering covers them). NOTE: an evicted
+      // chip may still be running — its completion event patches this record
+      // by id in `markInFlightToolCallDone`.
+      const evicted = nextCalls
+        .filter((tc) => !capped.includes(tc) && tc.action_id == null && !isToolRowSkipped(tc.tool))
+        .map((tc): ToolCallRecord => ({
+          id: tc.tool_use_id,
+          tool: tc.tool,
+          input: tc.input,
+          elapsedMs: Math.max(0, Date.now() - tc.startedAt),
+        }));
       const next = new Map(state.inFlightByAgent);
-      next.set(agentId, { ...current, activeToolCalls: nextCalls, everShownThisTurn: true });
+      next.set(agentId, {
+        ...current,
+        activeToolCalls: capped,
+        completedToolCalls: [...(current.completedToolCalls ?? []), ...evicted],
+        everShownThisTurn: true,
+      });
       return { inFlightByAgent: next };
     });
   },
 
-  markInFlightToolCallDone: (agentId: string) => {
+  markInFlightToolCallDone: (agentId: string, detail?: { output?: string; isError?: boolean; toolUseId?: string }) => {
     set((state) => {
       const current = state.inFlightByAgent.get(agentId);
       if (!current) return state;
-      const idx = current.activeToolCalls.findIndex((tc) => tc.action_id == null && !tc.done);
+      // Outputs can be huge (a test run's full log). Cap what the turn holds
+      // in memory — ToolCallGroup truncates again for display.
+      const output = detail?.output != null && detail.output.length > TOOL_OUTPUT_STORE_MAX_CHARS
+        ? detail.output.slice(0, TOOL_OUTPUT_STORE_MAX_CHARS) + "\n… (truncated)"
+        : detail?.output;
+      // Id match first — parallel tool calls complete out of order, and the
+      // provider's per-call id is the only correct join.
+      let idx = detail?.toolUseId
+        ? current.activeToolCalls.findIndex(
+            (tc) => tc.action_id == null && !tc.done && tc.tool_use_id === detail.toolUseId
+          )
+        : -1;
+      if (idx === -1 && detail?.toolUseId) {
+        // The chip may already have been salvaged into the transcript (cap
+        // eviction, or the first-text flush) while still running — patch THAT
+        // record by id rather than falling through to FIFO, which would hang
+        // this call's output on an unrelated chip.
+        const recIdx = (current.completedToolCalls ?? []).findIndex((r) => r.id === detail.toolUseId);
+        if (recIdx !== -1) {
+          const completed = [...(current.completedToolCalls ?? [])];
+          completed[recIdx] = { ...completed[recIdx], output, isError: detail?.isError };
+          const next = new Map(state.inFlightByAgent);
+          next.set(agentId, { ...current, completedToolCalls: completed });
+          return { inFlightByAgent: next };
+        }
+      }
+      if (idx === -1) {
+        // FIFO fallback for providers that don't thread ids through.
+        idx = current.activeToolCalls.findIndex((tc) => tc.action_id == null && !tc.done);
+      }
       if (idx === -1) return state;
-      const nextCalls = [...current.activeToolCalls];
-      nextCalls[idx] = { ...nextCalls[idx], done: true };
+      // Move the finished chip out of the transient indicator stack into the
+      // turn's persistent tool transcript — the row it renders as (via
+      // ToolCallGroup) occupies the same bubble space the chip did, so the
+      // bubble doesn't shrink-then-regrow the way a plain removal would.
+      const chip = current.activeToolCalls[idx];
+      const nextCalls = current.activeToolCalls.filter((_, i) => i !== idx);
+      // Skip-listed tools (AskUserQuestionWithForm, ArtifactWrite) have their
+      // own richer rendering — same exclusion the history pairing applies, so
+      // the live stamp and the post-refetch view don't differ.
+      const completedToolCalls = isToolRowSkipped(chip.tool)
+        ? current.completedToolCalls
+        : [
+            ...(current.completedToolCalls ?? []),
+            {
+              id: chip.tool_use_id,
+              tool: chip.tool,
+              input: chip.input,
+              output,
+              isError: detail?.isError,
+              elapsedMs: Math.max(0, Date.now() - chip.startedAt),
+            } satisfies ToolCallRecord,
+          ];
       const next = new Map(state.inFlightByAgent);
-      next.set(agentId, { ...current, activeToolCalls: nextCalls });
+      next.set(agentId, {
+        ...current,
+        activeToolCalls: nextCalls,
+        completedToolCalls,
+      });
       return { inFlightByAgent: next };
     });
   },
@@ -1758,8 +1921,47 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((state) => {
       const current = state.inFlightByAgent.get(agentId);
       if (!current || current.activeToolCalls.length === 0) return state;
+      // Salvage unfinished CLASSIC chips into the turn's persistent tool
+      // transcript before clearing — their completion event may never arrive
+      // (run ended mid-call, continuation-loop boundary), but the call did
+      // run and belongs in the transcript. `action_id`-keyed chips self-remove
+      // on their own completion and are dropped here as before.
+      const salvaged: ToolCallRecord[] = current.activeToolCalls
+        .filter((tc) => tc.action_id == null && !tc.done && !isToolRowSkipped(tc.tool))
+        .map((tc) => ({
+          id: tc.tool_use_id,
+          tool: tc.tool,
+          input: tc.input,
+          elapsedMs: Math.max(0, Date.now() - tc.startedAt),
+        }));
       const next = new Map(state.inFlightByAgent);
-      next.set(agentId, { ...current, activeToolCalls: EMPTY_TOOL_CALLS });
+      next.set(agentId, {
+        ...current,
+        activeToolCalls: EMPTY_TOOL_CALLS,
+        completedToolCalls: [...(current.completedToolCalls ?? []), ...salvaged],
+      });
+      return { inFlightByAgent: next };
+    });
+  },
+
+  flushClassicToolCalls: (agentId: string) => {
+    set((state) => {
+      const current = state.inFlightByAgent.get(agentId);
+      if (!current || !current.activeToolCalls.some((tc) => tc.action_id == null)) return state;
+      const salvaged: ToolCallRecord[] = current.activeToolCalls
+        .filter((tc) => tc.action_id == null && !isToolRowSkipped(tc.tool))
+        .map((tc) => ({
+          id: tc.tool_use_id,
+          tool: tc.tool,
+          input: tc.input,
+          elapsedMs: Math.max(0, Date.now() - tc.startedAt),
+        }));
+      const next = new Map(state.inFlightByAgent);
+      next.set(agentId, {
+        ...current,
+        activeToolCalls: current.activeToolCalls.filter((tc) => tc.action_id != null),
+        completedToolCalls: [...(current.completedToolCalls ?? []), ...salvaged],
+      });
       return { inFlightByAgent: next };
     });
   },
@@ -1865,6 +2067,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       next.set(agentId, {
         textBuffer: current?.textBuffer ?? "",
         activeToolCalls: current?.activeToolCalls ?? EMPTY_TOOL_CALLS,
+        completedToolCalls: current?.completedToolCalls,
         isTyping: current?.isTyping ?? true,
         startedAt: current?.startedAt ?? Date.now(),
         artifactIds: current?.artifactIds ?? EMPTY_ARTIFACT_IDS,
@@ -1892,6 +2095,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       next.set(agentId, {
         textBuffer: current?.textBuffer ?? "",
         activeToolCalls: current?.activeToolCalls ?? EMPTY_TOOL_CALLS,
+        completedToolCalls: current?.completedToolCalls,
         isTyping: current?.isTyping ?? true,
         startedAt: current?.startedAt ?? Date.now(),
         artifactIds: current?.artifactIds ?? EMPTY_ARTIFACT_IDS,
@@ -2924,6 +3128,14 @@ export function useIsAgentTurnActive(agentId: string | null | undefined, threadI
 
 export function useActiveToolCalls(agentId: string | null | undefined, threadId?: string): ActiveToolCall[] {
   return useChatStore((s) => (agentId ? s.inFlightByAgent.get(inFlightKey(agentId, threadId))?.activeToolCalls ?? EMPTY_TOOL_CALLS : EMPTY_TOOL_CALLS));
+}
+
+const EMPTY_TOOL_CALL_RECORDS: ToolCallRecord[] = [];
+
+/** The current turn's finished tool calls, in completion order — feeds the
+ *  live `ToolCallGroup` rows in StreamingMessage. */
+export function useCompletedToolCalls(agentId: string | null | undefined, threadId?: string): ToolCallRecord[] {
+  return useChatStore((s) => (agentId ? s.inFlightByAgent.get(inFlightKey(agentId, threadId))?.completedToolCalls ?? EMPTY_TOOL_CALL_RECORDS : EMPTY_TOOL_CALL_RECORDS));
 }
 
 /** Ids of artifacts produced so far by the currently-streaming turn — the

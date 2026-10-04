@@ -256,6 +256,45 @@ async fn check_cli_available(command: String, version_flag: String) -> Result<bo
     rx.recv().map_err(|e| e.to_string())
 }
 
+/// Like `check_cli_available`, but returns the binary's version string
+/// instead of a bare yes/no, so templates with a known-minimum version can
+/// flag a stale install (an older binary earlier on PATH shadows a current
+/// one — observed in the wild with a Homebrew droid 0.129.0 shadowing
+/// 0.232.0, which failed every run). `None` means not runnable at all.
+/// The version is the first semver-looking token of combined stdout/stderr;
+/// binaries with unusual `--version` output fall back to the first line.
+#[tauri::command]
+async fn probe_cli_version(command: String, version_flag: String) -> Result<Option<String>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let version = std::process::Command::new(&command)
+            .arg(&version_flag)
+            .env("PATH", ao_process::shell_path())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+                let text = if stdout.trim().is_empty() {
+                    String::from_utf8_lossy(&o.stderr).into_owned()
+                } else {
+                    stdout
+                };
+                text.split_whitespace()
+                    .find_map(|tok| {
+                        let t = tok.trim_start_matches('v');
+                        (t.chars().next().is_some_and(|c| c.is_ascii_digit())
+                            && t.contains('.'))
+                        .then(|| t.to_string())
+                    })
+                    .or_else(|| text.lines().next().map(|l| l.trim().to_string()))
+            })
+            .filter(|s| !s.is_empty());
+        let _ = tx.send(version);
+    });
+    rx.recv().map_err(|e| e.to_string())
+}
+
 /// What [`restart_app`] actually did, reported back to the frontend so it
 /// can tell a real restart apart from the dev build's deliberate no-op —
 /// see that command's doc comment. A bare success/failure isn't enough
@@ -710,6 +749,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             check_cli_available,
+            probe_cli_version,
             set_vibrancy,
             open_devtools,
             copy_image_to_clipboard,

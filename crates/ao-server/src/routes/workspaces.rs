@@ -715,6 +715,22 @@ async fn probe_target_data_root(target_path: &Path, current_root: &Path) -> Resu
     if normalize_lexical(target_path) == normalize_lexical(current_root) {
         return Ok(());
     }
+    // Lexical equality misses aliases — symlinks, `..` survivors recorded
+    // differently, case variants on case-insensitive filesystems. Probing
+    // an aliased view of THIS process's live root would re-run
+    // `init_with_root`'s startup sweeps against our own in-flight state
+    // (the stale-assignment-run sweep would mark live rows Failed), so
+    // resolve both sides before falling through to a real probe. Either
+    // side failing to canonicalize (target doesn't exist yet) just falls
+    // back to probing, as before.
+    if let (Ok(target), Ok(current)) = (
+        tokio::fs::canonicalize(target_path).await,
+        tokio::fs::canonicalize(current_root).await,
+    ) {
+        if target == current {
+            return Ok(());
+        }
+    }
 
     PersistenceLayer::init_with_root(DataRoot::new(target_path))
         .await

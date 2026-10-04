@@ -814,7 +814,7 @@ fn parse_start_pairing_code<'a>(text: &'a str, bot_username: Option<&str>) -> Op
 /// out-of-band from any `PUT /agents/{id}` a client might be issuing at the
 /// same moment. Clearing `pending_pairing_code` in memory only guards a
 /// repeat `/start <code>` within this same long-poll batch; the code's own
-/// `expires_at_unix` (`PairingCode::generate`, 10 minutes) is what actually
+/// `expires_at_unix` (`PairingCode::generate`, 30 minutes) is what actually
 /// bounds reuse across a restart or the next poll iteration's fresh profile
 /// fetch.
 async fn try_link_chat(
@@ -960,6 +960,7 @@ mod tests {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: telegram_binding.into_iter().collect(),
             max_turns: None,
@@ -1324,6 +1325,7 @@ mod tests {
                 persistence: Arc::clone(&self.persistence),
                 queue_registry: Arc::clone(&self.queue_registry),
                 connection_state: Arc::new(ConnectionStateRegistry::new()),
+                owner_id: "test-owner".to_string(),
                 lease_gate: Arc::clone(&self.lease_gate),
                 event_bus: Arc::clone(&self.event_bus),
             }

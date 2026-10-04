@@ -394,6 +394,7 @@ mod unlink_revocation_tests {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![telegram_binding()],
             max_turns: None,

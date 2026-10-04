@@ -146,13 +146,21 @@ pub fn compose_system_prompt(
         blocks.push(block);
     }
 
-    // Section 5: static baseline collaboration guidance
-    blocks.push(BASELINE_GUIDANCE.to_string());
+    // Sections 5/5b/9 are platform-level instruction blocks. `minimal_prompt`
+    // profiles (CLI harnesses with their own behavioral prompt) skip them —
+    // every turn pays for these tokens, and tool-routing doctrine can fight
+    // the harness's own rules.
+    let minimal = profile.minimal_prompt.unwrap_or(false);
 
-    // Section 5b: CLI tool preference — only for CLI runner mode.
-    // Native/API runs define their own tool set and must not see this section.
-    if profile.runner_mode == AgentRunnerMode::Cli {
-        blocks.push(CLI_TOOL_PREFERENCE.to_string());
+    if !minimal {
+        // Section 5: static baseline collaboration guidance
+        blocks.push(BASELINE_GUIDANCE.to_string());
+
+        // Section 5b: CLI tool preference — only for CLI runner mode.
+        // Native/API runs define their own tool set and must not see this section.
+        if profile.runner_mode == AgentRunnerMode::Cli {
+            blocks.push(CLI_TOOL_PREFERENCE.to_string());
+        }
     }
 
     // Section 6: delegate targets (omitted when empty — placed adjacent to BASELINE_GUIDANCE
@@ -171,8 +179,11 @@ pub fn compose_system_prompt(
         blocks.push(block);
     }
 
-    // Section 9: memory save guidance (static)
-    blocks.push(MEMORY_SAVE_INSTRUCTION.trim().to_string());
+    // Section 9: memory save guidance (static, platform-level — skipped for
+    // minimal_prompt profiles like the other instruction blocks)
+    if !minimal {
+        blocks.push(MEMORY_SAVE_INSTRUCTION.trim().to_string());
+    }
 
     // Section 10: workflows (id + name only; omitted when empty)
     if let Some(block) = build_workflows_section(workflows) {

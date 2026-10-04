@@ -103,6 +103,7 @@ an agent, the app probes your `PATH` and marks which of these it found:
 | Cursor | `cursor-agent` |
 | Codex | `codex` |
 | Antigravity | `agy` |
+| Factory Droid | `droid` |
 
 Pick the one you have and its command and arguments are filled in for you.
 
@@ -111,8 +112,25 @@ Pick the one you have and its command and arguments are filled in for you.
 > rougher edges, and please open an issue when you hit one. The differences that are already
 > known are about where each CLI will accept MCP configuration, and they are written up at the
 > functions that handle them in `crates/ao-engine/src/agent_runner/cli.rs`: Claude and Codex take
-> per-invocation config, while `cursor-agent` and `agy` have no such flag, so Launchpad has to
-> merge its entry into a config file they share across sessions.
+> per-invocation config, while `cursor-agent`, `agy`, and `droid` have no such flag, so Launchpad
+> has to merge its entry into a config file they share across sessions (`.cursor/mcp.json`,
+> `~/.gemini/config/mcp_config.json`, and `.factory/mcp.json` respectively).
+>
+> Three droid-specific notes, all verified against droid 0.232.0. First, the spawned `droid` is
+> resolved from `PATH`, and an older copy (for example a stale Homebrew install) can shadow a
+> current one — droid under 0.2xx exits with an error immediately in this setup. The template
+> picker probes the resolved binary's version and shows the Droid chip as **outdated** when it is
+> below the verified minimum, so a shadowed install is visible before you create the agent.
+> Second, droid connects every server in your user-level `~/.factory/mcp.json` at startup and
+> snapshots the model's tool catalog when the run starts; with a large or slow roster that both
+> delays every turn and can leave Launchpad's own tools invisible to the model. Launchpad
+> therefore runs each droid agent against a minimal per-agent Factory home
+> (`<agent home>/factory-home`, carrying only your auth files and `settings.json`) via
+> `FACTORY_HOME_OVERRIDE`, so droid connects just the Launchpad server. Set the same variable in
+> the agent's env yourself if you want the full user roster instead. Third, droid agents resume
+> across turns: Launchpad tracks the session id each run reports (per agent, per thread, in
+> `<agent home>/cli-sessions.json`) and passes it back with `-s`, so the model remembers the
+> conversation and later turns start faster.
 
 **Otherwise, use a provider API key.** Set an agent's kind to **Native (API)** and it runs an
 in-process client instead of spawning anything. Three providers are wired to that path —

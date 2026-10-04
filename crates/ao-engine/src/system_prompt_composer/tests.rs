@@ -60,6 +60,7 @@ fn minimal_profile() -> AgentProfile {
         persona: None,
         special_instructions: None,
         legacy_system_prompt: None,
+        minimal_prompt: None,
         max_delegation_depth: None,
         channels: vec![],
         max_turns: None,
@@ -163,6 +164,78 @@ fn snapshot_minimal_profile() {
         None,
     );
     insta::assert_snapshot!(result);
+}
+
+// ── minimal_prompt: platform instruction blocks omitted, authored/context kept ──
+
+#[test]
+fn minimal_prompt_omits_platform_instruction_blocks() {
+    let profile = AgentProfile {
+        description: "probe".into(),
+        persona: Some("You are a verification agent.".into()),
+        special_instructions: Some("Answer directly.".into()),
+        minimal_prompt: Some(true),
+        ..minimal_profile()
+    };
+    let (workspace_ctx, agent_home_ctx) = empty_contexts();
+    let result = compose_system_prompt(
+        &profile,
+        &no_name_prefs(),
+        &workspace_ctx,
+        &agent_home_ctx,
+        &[make_memory("user prefers dark mode")],
+        &[],
+        &[],
+        &[],
+        &[],
+        FROZEN_DATE,
+        None,
+    );
+
+    // The three platform-level instruction blocks are gone…
+    assert!(
+        !result.contains("# Tool Selection"),
+        "baseline guidance must be omitted: {result}"
+    );
+    assert!(
+        !result.contains("# Prefer Launchpad Tools"),
+        "CLI tool preference must be omitted: {result}"
+    );
+    assert!(
+        !result.contains("# Memory Management"),
+        "memory-save guidance must be omitted: {result}"
+    );
+    // …while identity, authored guidance, run-context, and memory DATA survive.
+    assert!(result.contains("# TestBot"));
+    assert!(result.contains("You are a verification agent."));
+    assert!(result.contains("Answer directly."));
+    assert!(result.contains("<run-context>"));
+    assert!(
+        result.contains("user prefers dark mode"),
+        "memory entries are data, not instructions: {result}"
+    );
+}
+
+#[test]
+fn minimal_prompt_absent_keeps_platform_blocks() {
+    let profile = minimal_profile();
+    let (workspace_ctx, agent_home_ctx) = empty_contexts();
+    let result = compose_system_prompt(
+        &profile,
+        &no_name_prefs(),
+        &workspace_ctx,
+        &agent_home_ctx,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        FROZEN_DATE,
+        None,
+    );
+    assert!(result.contains("# Tool Selection"));
+    assert!(result.contains("# Prefer Launchpad Tools"));
+    assert!(result.contains("# Memory Management"));
 }
 
 // ── Scenario: full profile (all fields populated) ──

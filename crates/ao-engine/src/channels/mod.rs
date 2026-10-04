@@ -18,6 +18,13 @@
 pub mod connection_state;
 pub mod discord;
 pub mod email;
+/// The Matrix transport compiles away under `--no-default-features` (its
+/// `matrix-sdk` dependency is optional) — see `matrix/mod.rs`'s doc. `pub`
+/// so ao-server's `routes/matrix.rs` can reach the D1 facade (only the
+/// items `matrix/mod.rs` explicitly re-exports are visible; the internals
+/// stay crate-private).
+#[cfg(feature = "matrix")]
+pub mod matrix;
 pub(crate) mod relay;
 pub mod slack;
 
@@ -56,6 +63,12 @@ pub struct ChannelRunContext {
     pub binding_id: String,
     pub persistence: Arc<PersistenceLayer>,
     pub queue_registry: Arc<QueueManagerRegistry>,
+    /// This process's channel-lease owner id (the same string
+    /// `ChannelLeaseStore` claims carry). Transports that run a client with
+    /// its own cross-process locking — the Matrix SDK's store locks, per
+    /// guide/MATRIX_PLAN.md D4 — reuse it as the lock holder name so "who
+    /// owns this binding" has one answer at both layers.
+    pub owner_id: String,
     /// Where a transport reports its own connect/backoff transitions — see
     /// [`ConnectionStateRegistry`]'s doc for who else
     /// writes to it and how `GET /agents/{id}/channels` reads it back.
@@ -539,6 +552,7 @@ mod tests {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
                     max_output_tokens: None,
@@ -572,6 +586,7 @@ mod tests {
             persistence,
             queue_registry,
             connection_state: Arc::new(ConnectionStateRegistry::new()),
+            owner_id: "test-owner".to_string(),
             lease_gate: Arc::new(LeaseGate::new()),
             event_bus,
         };

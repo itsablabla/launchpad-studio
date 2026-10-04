@@ -60,6 +60,7 @@ fn make_test_profile(id: &str) -> AgentProfile {
         persona: None,
         special_instructions: None,
         legacy_system_prompt: None,
+        minimal_prompt: None,
         max_delegation_depth: None,
         channels: vec![],
         max_turns: None,
@@ -356,6 +357,65 @@ async fn init_with_root_backfill_never_marks_the_default_thread_even_if_policy_l
         thread.assignment_origin.is_none(),
         "a leftover Main-era run must never cause the shared default thread to be marked assignment-owned"
     );
+}
+
+// --- Startup stale-run sweep ---
+
+#[tokio::test]
+async fn init_with_root_fails_assignment_runs_stuck_in_queued_or_running() {
+    use ao_protocol::assignment::AssignmentRunStatus;
+
+    let (_tmp, data_root) = setup_temp_data_root();
+    data_root.ensure_directories().await.unwrap();
+
+    let profile = make_test_profile("stale-agent");
+    AgentProfileStore::new(data_root.clone()).create(&profile).await.unwrap();
+
+    let assignments = AssignmentStore::load(data_root.clone()).await.unwrap();
+    assignments
+        .add(cron_assignment_row("assign-stale", "stale-agent", AssignmentThreadPolicy::Fresh))
+        .await
+        .unwrap();
+    let assignment_runs = AssignmentRunStore::new(data_root.clone());
+    // Rows left behind by a process that died mid-flight: one dispatched
+    // (Running), one accepted but never started (Queued), one genuinely
+    // finished (Succeeded — control, must survive untouched).
+    let mut running = assignment_run_row("run-running", "assign-stale", "stale-agent", "t-1");
+    running.status = AssignmentRunStatus::Running;
+    running.started_ts = Some(Utc::now());
+    let mut queued = assignment_run_row("run-queued", "assign-stale", "stale-agent", "t-2");
+    queued.status = AssignmentRunStatus::Queued;
+    let done = assignment_run_row("run-done", "assign-stale", "stale-agent", "t-3");
+    for run in [&running, &queued, &done] {
+        assignment_runs.append("assign-stale", run).await.unwrap();
+    }
+
+    let layer = PersistenceLayer::init_with_root(data_root).await.unwrap();
+
+    for id in ["run-running", "run-queued"] {
+        let run = layer
+            .assignment_runs
+            .get("assign-stale", id)
+            .await
+            .unwrap()
+            .expect("run row must still exist");
+        assert_eq!(
+            run.status,
+            AssignmentRunStatus::Failed,
+            "{id} is owned by a dead process and must not render as live"
+        );
+        assert!(run.error.is_some(), "{id} must carry an explanation");
+        assert!(run.finished_ts.is_some(), "{id} must be stamped finished");
+    }
+
+    let done = layer
+        .assignment_runs
+        .get("assign-stale", "run-done")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.status, AssignmentRunStatus::Succeeded, "terminal rows are not the sweep's business");
+    assert!(done.error.is_none());
 }
 
 // --- DataRoot / paths tests ---
@@ -684,6 +744,57 @@ async fn test_clone_agent_home_default_copies_contents_isolated() {
             .await
             .unwrap(),
         "original skill"
+    );
+}
+
+#[tokio::test]
+async fn test_clone_agent_home_excludes_cli_session_state() {
+    let (_tmp, data_root) = setup_temp_data_root();
+    data_root.ensure_directories().await.unwrap();
+    let store = profiles::AgentProfileStore::new(data_root.clone());
+
+    // Parent home carries an active droid CLI session: the resume store,
+    // the provider session files, AND auth material.
+    let parent = make_test_profile("parent-sess");
+    let parent_home = data_root.agent_home_dir(&parent.id);
+    let sessions_dir = parent_home.join("factory-home/.factory/sessions/proj-slug");
+    tokio::fs::create_dir_all(&sessions_dir).await.unwrap();
+    tokio::fs::write(parent_home.join("cli-sessions.json"), b"{\"droid:default\":\"sess-1\"}")
+        .await
+        .unwrap();
+    tokio::fs::write(sessions_dir.join("sess-1.jsonl"), b"{}")
+        .await
+        .unwrap();
+    tokio::fs::write(parent_home.join("factory-home/.factory/auth.v2.json"), b"{}")
+        .await
+        .unwrap();
+    tokio::fs::write(parent_home.join("factory-home/.factory/settings.json"), b"{}")
+        .await
+        .unwrap();
+
+    let cloned = store.clone_agent_home(&parent, "child-sess").await.unwrap();
+    let child_home = data_root.agent_home_dir("child-sess");
+    assert!(matches!(&cloned, profiles::ClonedHome::NewDefault(_)));
+
+    // Session state stays behind — otherwise the clone's first run would
+    // splice the parent's session id into argv and resume the parent's
+    // conversation (the copied session files pass the byte/turn caps).
+    assert!(
+        !tokio::fs::try_exists(child_home.join("cli-sessions.json")).await.unwrap_or(false),
+        "cli-sessions.json must not be cloned"
+    );
+    assert!(
+        !tokio::fs::try_exists(child_home.join("factory-home/.factory/sessions")).await.unwrap_or(false),
+        "the droid session store must not be cloned"
+    );
+    // Auth and settings still cross so the clone stays logged in.
+    assert!(
+        tokio::fs::try_exists(child_home.join("factory-home/.factory/auth.v2.json")).await.unwrap_or(false),
+        "auth material must still be cloned"
+    );
+    assert!(
+        tokio::fs::try_exists(child_home.join("factory-home/.factory/settings.json")).await.unwrap_or(false),
+        "settings must still be cloned"
     );
 }
 

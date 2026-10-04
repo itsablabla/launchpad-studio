@@ -168,20 +168,17 @@ describe("native tool_call and tool_use coexistence", () => {
     expect(calls.find((c) => c.tool === "Read")).toBeDefined();
     expect(calls.find((c) => c.tool === "DateTime")).toBeDefined();
 
-    // markInFlightToolCallDone marks only the native chip done — it stays in
-    // the array (no shrink/regrow) rather than being removed. See the
-    // "jumpy tool indicator" fix: a classic chip now only leaves the array
-    // via text_delta's flush, finalize, run_ended, or the stacking cap.
+    // markInFlightToolCallDone moves only the native chip out of the
+    // indicator stack (into the turn's persistent completedToolCalls
+    // transcript) — the action_id-keyed chip is untouched.
     store().markInFlightToolCallDone(AGENT_ID);
     const afterDone = getToolCalls();
-    expect(afterDone).toHaveLength(2);
-    expect(afterDone.find((c) => c.tool === "Read")?.done).toBe(true);
+    expect(afterDone).toHaveLength(1);
     expect(afterDone.find((c) => c.tool === "DateTime")?.done).toBeFalsy();
 
     // removeInFlightAgentAction removes only the tool_use chip
     store().removeInFlightAgentAction(AGENT_ID, "tu-1");
     const after = getToolCalls();
-    expect(after).toHaveLength(1);
-    expect(after[0].tool).toBe("Read");
+    expect(after).toHaveLength(0);
   });
 });

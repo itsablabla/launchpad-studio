@@ -60,6 +60,18 @@ pub enum ChannelCursor {
         #[serde(default)]
         seen_event_ids: Vec<String>,
     },
+    /// Matrix `/sync`'s `next_batch` token: the server's own resume cursor —
+    /// the Telegram `offset` analogue, persisted only after a batch's events
+    /// are fully handled (same crash-window invariant). `seen_event_ids` is
+    /// a bounded FIFO (Discord-cursor-style) for belt-and-braces dedup
+    /// across the crash-between-handle-and-persist window, since `/sync`
+    /// re-serves the batch boundary after a crash.
+    Matrix {
+        #[serde(default)]
+        next_batch: Option<String>,
+        #[serde(default)]
+        seen_event_ids: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -101,5 +113,32 @@ mod tests {
         let json = serde_json::to_string(&cursor).unwrap();
         let back: ChannelCursor = serde_json::from_str(&json).unwrap();
         assert_eq!(cursor, back);
+    }
+
+    #[test]
+    fn matrix_cursor_round_trips_through_json() {
+        let cursor = ChannelCursor::Matrix {
+            next_batch: Some("s123_456".to_string()),
+            seen_event_ids: vec!["$evt1".to_string(), "$evt2".to_string()],
+        };
+        let json = serde_json::to_string(&cursor).unwrap();
+        let back: ChannelCursor = serde_json::from_str(&json).unwrap();
+        assert_eq!(cursor, back);
+    }
+
+    #[test]
+    fn matrix_cursor_with_missing_fields_defaults_empty() {
+        // A cursor written by an older build (or hand-seeded) with neither
+        // field present must still parse, defaulting to "sync from scratch,
+        // nothing seen yet". (Tag values are the variant names verbatim —
+        // this enum is not snake_case-renamed.)
+        let back: ChannelCursor = serde_json::from_str(r#"{"kind":"Matrix"}"#).unwrap();
+        assert_eq!(
+            back,
+            ChannelCursor::Matrix {
+                next_batch: None,
+                seen_event_ids: vec![],
+            }
+        );
     }
 }

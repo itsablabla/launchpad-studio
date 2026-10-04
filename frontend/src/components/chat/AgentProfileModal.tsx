@@ -12,6 +12,7 @@ import {
 import { AnimatePresence, motion } from "framer-motion";
 import {
     BookUser,
+    Brackets,
     Check,
     ChevronRight,
     Copy,
@@ -37,22 +38,27 @@ import { useIsDark, useUserPreferencesStore } from "../../stores/userPreferences
 import { AGENT_TEMPLATES, DEFAULT_PERSONA } from "../../data/agentTemplates";
 import {
     ApiError,
+    createMatrixPairingCode,
     createTelegramPairingCode,
     deleteDiscordChannel,
     deleteEmailChannel,
+    deleteMatrixConnection,
     deleteSlackChannel,
     deleteTelegramToken,
     getAgentChannels,
     getChannelSenders,
     getComposedPrompt,
+    getMatrixStatus,
     getSlackManifest,
     getTelegramStatus,
     setChannelSenders,
     setDiscordChannelSecret,
     setEmailChannelSecret,
+    setMatrixConnection,
     setSlackChannelSecret,
     setTelegramToken,
     testSlackConnection,
+    unlinkMatrixRoom,
     unlinkTelegramChat,
     upsertDiscordChannel,
     upsertEmailChannel,
@@ -61,6 +67,7 @@ import {
     type ChannelStatus,
     type DiscordChannelConfig,
     type EmailChannelConfig,
+    type MatrixStatus,
     type SlackChannelConfig,
     type SlackConversationMode,
     type SlackTestConnectionReport,
@@ -356,6 +363,10 @@ function AgentProfileFormBody({ initial, onClose, onSubmit, onClone, onDelete }:
             modelAliases: {},
             model: "",
             customModelMode: false,
+            // The template's session-id extraction wiring — without this the
+            // submit would persist `[]` and the new agent's resume_args
+            // could never fire (no session id is ever captured).
+            sessionIdFields: [...(tpl.provider.session_id_fields ?? [])],
         }));
     }, []);
 
@@ -424,9 +435,15 @@ function AgentProfileFormBody({ initial, onClose, onSubmit, onClone, onDelete }:
                 system_prompt_arg: advancedValue.systemPromptArg.trim() || null,
                 session_arg: advancedValue.sessionArg.trim() || null,
                 resume_args: advancedValue.resumeArgs,
-                session_id_fields: [],
+                // Carried from the fetched profile / selected template, not
+                // hardcoded — `[]` here would silently disable session-id
+                // capture and break resume for template-created and
+                // yaml-authored agents on any unrelated save.
+                session_id_fields: advancedValue.sessionIdFields,
                 clear_env: advancedValue.clearEnv,
                 no_output_timeout_ms: parseInt(advancedValue.noOutputTimeoutMs) || 30000,
+                // Not editable here — same clobber risk as the fields below.
+                file_capabilities: initial?.provider.file_capabilities ?? null,
             },
             model: advancedValue.model.trim() || null,
             skills: [],
@@ -440,7 +457,9 @@ function AgentProfileFormBody({ initial, onClose, onSubmit, onClone, onDelete }:
             max_turns: parseMaxTurns(advancedValue.maxTurns),
             working_dir: workingDir.trim() || null,
             home_dir: homeDir.trim() || null,
-            serialize: true,
+            // Carried through, not hardcoded — a yaml-authored
+            // `serialize: false` must survive an unrelated modal save.
+            serialize: initial?.serialize ?? true,
             workflows: initial?.workflows,
             template: advancedValue.selectedTemplate ?? null,
             runner_mode: advancedValue.runnerMode,
@@ -451,6 +470,26 @@ function AgentProfileFormBody({ initial, onClose, onSubmit, onClone, onDelete }:
             native_provider: advancedValue.nativeProvider,
             delegates_to: delegatesTo.length > 0 ? delegatesTo : undefined,
             telegram: telegramConfig,
+            // Not editable here — carried through so a modal save doesn't
+            // clobber the yaml-authored flag (the PUT replaces the whole
+            // profile server-side).
+            minimal_prompt: initial?.minimal_prompt ?? null,
+            // Same carry-through treatment for every other server-owned
+            // field this modal doesn't edit: without these, saving an
+            // unrelated change (e.g. renaming the agent) silently resets
+            // them to serde defaults — plugin/skill enablement from the
+            // Competencies modal, API-mode tunables, the delegate depth
+            // cap, the team link, and the AgentAuthor undo buffer.
+            enabled_plugins: initial?.enabled_plugins,
+            enabled_launchpad_global_skills: initial?.enabled_launchpad_global_skills,
+            enabled_launchpad_project_skills: initial?.enabled_launchpad_project_skills,
+            thinking: initial?.thinking ?? null,
+            max_output_tokens: initial?.max_output_tokens ?? null,
+            max_context_tokens: initial?.max_context_tokens ?? null,
+            reasoning_effort: initial?.reasoning_effort ?? null,
+            max_delegation_depth: initial?.max_delegation_depth ?? null,
+            owning_team_id: initial?.owning_team_id ?? null,
+            legacy_system_prompt: initial?.legacy_system_prompt ?? null,
         };
         try {
             await onSubmit(profile);
@@ -783,11 +822,12 @@ export interface ChannelSaveHandle {
     save: () => Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
-const CHANNEL_SUB_TABS: { id: "telegram" | "discord" | "email" | "slack"; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
+const CHANNEL_SUB_TABS: { id: "telegram" | "discord" | "email" | "slack" | "matrix"; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
     { id: "telegram", label: "Telegram", icon: Send },
     { id: "discord", label: "Discord", icon: Hash },
     { id: "email", label: "Email", icon: Mail },
     { id: "slack", label: "Slack", icon: Slack },
+    { id: "matrix", label: "Matrix", icon: Brackets },
 ];
 
 const CHANNEL_CONNECTION_LABEL: Record<ChannelConnectionState, string> = {
@@ -867,16 +907,16 @@ export function ChannelsTabPanel({
     onEmailConfiguredChange?: (configured: boolean) => void;
     onSlackConfiguredChange?: (configured: boolean) => void;
 }) {
-    const [activeChannel, setActiveChannel] = useState<"telegram" | "discord" | "email" | "slack">("telegram");
+    const [activeChannel, setActiveChannel] = useState<"telegram" | "discord" | "email" | "slack" | "matrix">("telegram");
     // Once a sub-tab has been visited, keep its panel mounted (just hidden)
     // instead of unmounting it on switch — Discord/Email/Slack each hold
     // their own local, unsaved field state, and the single primary Save
     // button at the bottom of the modal needs that state to still be alive
     // (and its imperative ref still attached) even after the user has since
     // clicked over to a different channel sub-tab to configure that one too.
-    const [visited, setVisited] = useState<Set<"telegram" | "discord" | "email" | "slack">>(() => new Set(["telegram"]));
+    const [visited, setVisited] = useState<Set<"telegram" | "discord" | "email" | "slack" | "matrix">>(() => new Set(["telegram"]));
 
-    const selectChannel = (id: "telegram" | "discord" | "email" | "slack") => {
+    const selectChannel = (id: "telegram" | "discord" | "email" | "slack" | "matrix") => {
         setActiveChannel(id);
         setVisited((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
     };
@@ -942,6 +982,11 @@ export function ChannelsTabPanel({
                         isCreating={isCreating}
                         onConfiguredChange={onSlackConfiguredChange}
                     />
+                </div>
+            )}
+            {visited.has("matrix") && (
+                <div className={activeChannel === "matrix" ? undefined : "hidden"}>
+                    <MatrixTabPanel agentId={agentId} isCreating={isCreating} />
                 </div>
             )}
         </div>
@@ -1297,7 +1342,7 @@ export function TelegramTabPanel({
                                     <span className="font-mono text-[var(--modal-text-secondary)]">/start &lt;code&gt;</span> in that chat.{" "}
                                     <span className="font-mono text-[var(--modal-text-secondary)]">/start@yourbot &lt;code&gt;</span> also works.
                                 </li>
-                                <li>The code is single-use and expires in 10 minutes.</li>
+                                <li>The code is single-use and expires in 30 minutes.</li>
                                 <li>
                                     Pair each DM and each group separately — generate a fresh code for every chat you want to
                                     authorize. Adding a new chat does not remove chats you already paired.
@@ -1380,6 +1425,415 @@ export function TelegramTabPanel({
                     Once enabled, every Telegram chat that messages this agent — each private DM sender or
                     group — gets its own dedicated thread, created automatically the first time that chat sends
                     a message and kept isolated from every other chat's conversation.
+                </p>
+            )}
+        </div>
+    );
+}
+
+// ─── Matrix tab ────────────────────────────────────────────────────────────────
+
+/** Setup surface for the per-agent Matrix channel. Structurally mirrors
+ *  [`TelegramTabPanel`] (dedicated connection endpoints, write-only secret,
+ *  pairing codes, linked-conversation list) with three Matrix-shaped
+ *  differences: the connection needs a homeserver URL alongside the
+ *  credential; the credential is *either* a raw access token *or* a
+ *  username/password pair the backend logs in with once (keeping the minted
+ *  token + device id, discarding the password); and the status endpoint
+ *  already carries the live `connection_state`, so no second fetch against
+ *  `GET …/channels` is needed (Telegram's tab has to do that separately).
+ *
+ *  There is deliberately no enable toggle riding the modal's primary Save:
+ *  connecting validates + vaults + enables in one server-side step, and
+ *  disconnecting disables — the binding has no draftable config of its own
+ *  in v1 (addressing defaults live in `ChannelKindConfig::Matrix`). */
+export function MatrixTabPanel({ agentId, isCreating }: { agentId: string; isCreating: boolean }) {
+    const [status, setStatus] = useState<MatrixStatus | null>(null);
+    const [statusLoading, setStatusLoading] = useState(false);
+    const [statusError, setStatusError] = useState<string | null>(null);
+
+    const [showForm, setShowForm] = useState(false);
+    const [homeserverInput, setHomeserverInput] = useState("");
+    const [authMode, setAuthMode] = useState<"password" | "token">("password");
+    const [usernameInput, setUsernameInput] = useState("");
+    const [passwordInput, setPasswordInput] = useState("");
+    const [tokenInput, setTokenInput] = useState("");
+    const [connecting, setConnecting] = useState(false);
+    const [connectError, setConnectError] = useState<string | null>(null);
+
+    const [removing, setRemoving] = useState(false);
+    const [removeError, setRemoveError] = useState<string | null>(null);
+
+    const [pairingLoading, setPairingLoading] = useState(false);
+    const [pairingError, setPairingError] = useState<string | null>(null);
+    const [codeCopied, setCodeCopied] = useState(false);
+    const [howToConnectOpen, setHowToConnectOpen] = useState(false);
+
+    const [unlinkingRoomId, setUnlinkingRoomId] = useState<string | null>(null);
+    const [unlinkError, setUnlinkError] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (isCreating) return;
+        let cancelled = false;
+        setStatusLoading(true);
+        setStatusError(null);
+        getMatrixStatus(agentId)
+            .then((s) => {
+                if (cancelled) return;
+                setStatus(s);
+                setShowForm(!s.has_token);
+                if (s.homeserver_url) setHomeserverInput(s.homeserver_url);
+            })
+            .catch((err) => {
+                if (cancelled) return;
+                setStatusError(err instanceof Error ? err.message : "Failed to load Matrix status");
+            })
+            .finally(() => {
+                if (!cancelled) setStatusLoading(false);
+            });
+        return () => { cancelled = true; };
+    }, [agentId, isCreating]);
+
+    const formReady =
+        homeserverInput.trim() !== "" &&
+        (authMode === "token"
+            ? tokenInput.trim() !== ""
+            : usernameInput.trim() !== "" && passwordInput !== "");
+
+    const handleConnect = async () => {
+        if (!formReady) return;
+        setConnecting(true);
+        setConnectError(null);
+        try {
+            await setMatrixConnection(agentId, {
+                homeserver_url: homeserverInput.trim(),
+                ...(authMode === "token"
+                    ? { access_token: tokenInput.trim() }
+                    : { username: usernameInput.trim(), password: passwordInput }),
+            });
+            // Re-read rather than synthesizing: the server caches the
+            // verified bot user id and the freshly-enabled flag.
+            const s = await getMatrixStatus(agentId);
+            setStatus(s);
+            setShowForm(false);
+            setTokenInput("");
+            setPasswordInput("");
+        } catch (err) {
+            setConnectError(err instanceof Error ? err.message : "Failed to connect");
+        } finally {
+            setConnecting(false);
+        }
+    };
+
+    const handleRemove = async () => {
+        setRemoving(true);
+        setRemoveError(null);
+        try {
+            await deleteMatrixConnection(agentId);
+            setStatus(await getMatrixStatus(agentId));
+            setShowForm(true);
+        } catch (err) {
+            setRemoveError(err instanceof Error ? err.message : "Failed to disconnect");
+        } finally {
+            setRemoving(false);
+        }
+    };
+
+    const handleGeneratePairingCode = async () => {
+        setPairingLoading(true);
+        setPairingError(null);
+        try {
+            await createMatrixPairingCode(agentId);
+            setStatus(await getMatrixStatus(agentId));
+        } catch (err) {
+            setPairingError(err instanceof Error ? err.message : "Failed to generate pairing code");
+        } finally {
+            setPairingLoading(false);
+        }
+    };
+
+    const handleCopyCode = async (code: string) => {
+        try {
+            await navigator.clipboard.writeText(code);
+            setCodeCopied(true);
+            window.setTimeout(() => setCodeCopied(false), 1500);
+        } catch {
+            // Silent — clipboard may be unavailable (no permission, no HTTPS/localhost).
+        }
+    };
+
+    const handleUnlinkRoom = async (roomId: string) => {
+        setUnlinkingRoomId(roomId);
+        setUnlinkError(null);
+        try {
+            const result = await unlinkMatrixRoom(agentId, roomId);
+            setStatus((prev) => (prev ? { ...prev, linked_rooms: result.linked_rooms, linked: result.linked_rooms.length > 0 } : prev));
+        } catch (err) {
+            setUnlinkError(err instanceof Error ? err.message : "Failed to unlink room");
+        } finally {
+            setUnlinkingRoomId(null);
+        }
+    };
+
+    if (isCreating) {
+        return <p className="text-[13px] text-[var(--modal-text-tertiary)] italic">Save the agent first to set up Matrix.</p>;
+    }
+
+    if (statusLoading && !status) {
+        return (
+            <div className="flex items-center gap-[8px] text-[13px] text-[var(--modal-text-tertiary)]">
+                <Loader2 className="w-[14px] h-[14px] animate-spin" /> Loading…
+            </div>
+        );
+    }
+
+    if (statusError && !status) {
+        return (
+            <div className="px-[10px] py-[8px] rounded-[8px] bg-[var(--error-bg)] border border-[var(--error-border)] text-[12px] text-[var(--error)]">
+                {statusError}
+            </div>
+        );
+    }
+
+    const pairingExpiresLabel = status?.pending_pairing_code ? formatPairingExpiry(status.pending_pairing_code.expires_at_unix) : null;
+    const activePairingCode = pairingExpiresLabel ? status?.pending_pairing_code ?? null : null;
+    const linkedRooms = status?.linked_rooms ?? [];
+
+    return (
+        <div className="flex flex-col gap-[16px]">
+            <p className="text-[13px] text-[var(--modal-text-secondary)]">
+                Connect this agent to a Matrix bot account. Point it at your homeserver and sign in with the
+                bot's username and password — or paste an access token directly if you manage sessions yourself.
+            </p>
+
+            {status?.has_token && !showForm && (
+                <div className="flex items-center justify-between gap-[12px] px-[14px] py-[12px] rounded-[10px] border border-[var(--modal-border-secondary)] bg-[var(--modal-bg-tertiary)]">
+                    <div className="flex flex-col gap-[4px]">
+                        <span className="text-[14px] font-medium text-[var(--modal-text-primary)] font-mono">{status.bot_user_id}</span>
+                        <span className="text-[12px] text-[var(--modal-text-tertiary)] font-mono">{status.homeserver_url}</span>
+                        <div className="flex items-center gap-[10px] text-[12px]">
+                            <span className={`inline-flex items-center gap-[5px] font-medium ${status.enabled ? "text-green-600" : "text-[var(--modal-text-tertiary)]"}`}>
+                                <Check className="w-[12px] h-[12px]" /> {status.enabled ? "Enabled" : "Disabled"}
+                            </span>
+                            <ChannelConnectionBadge state={status.connection_state} />
+                        </div>
+                    </div>
+                    <div className="flex items-center gap-[8px]">
+                        <button
+                            type="button"
+                            onClick={() => { setShowForm(true); setConnectError(null); }}
+                            className="h-[30px] px-[12px] rounded-[8px] text-[12px] text-[var(--modal-text-secondary)] hover:bg-[var(--modal-bg-hover)] transition-colors cursor-pointer"
+                        >
+                            Replace credentials
+                        </button>
+                        <button
+                            type="button"
+                            onClick={handleRemove}
+                            disabled={removing}
+                            className="h-[30px] px-[12px] rounded-[8px] text-[12px] font-medium text-[#E01E5A] hover:bg-[var(--modal-bg-hover)] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-[6px]"
+                        >
+                            {removing && <Loader2 className="w-[12px] h-[12px] animate-spin" />}
+                            {removing ? "Disconnecting…" : "Disconnect"}
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {removeError && (
+                <div className="px-[10px] py-[8px] rounded-[8px] bg-[var(--error-bg)] border border-[var(--error-border)] text-[12px] text-[var(--error)]">
+                    {removeError}
+                </div>
+            )}
+
+            {showForm && (
+                <div className="flex flex-col gap-[10px]">
+                    <div>
+                        <Label htmlFor="mx-homeserver">Homeserver URL</Label>
+                        <TextInput id="mx-homeserver" value={homeserverInput} onChange={setHomeserverInput} placeholder="https://matrix.example.com" monospace />
+                    </div>
+                    <div className="inline-flex items-center gap-[4px] self-start rounded-[10px] border border-[color-mix(in_srgb,var(--modal-border-secondary)_55%,var(--modal-text-tertiary)_45%)] p-[4px]">
+                        {([["password", "Username + password"], ["token", "Access token"]] as const).map(([mode, label]) => (
+                            <button
+                                key={mode}
+                                type="button"
+                                onClick={() => { setAuthMode(mode); setConnectError(null); }}
+                                className={`flex items-center gap-[6px] px-[12px] py-[6px] rounded-[8px] text-[12px] font-medium transition-colors cursor-pointer ${authMode === mode
+                                    ? "bg-[#1164A3] text-white shadow-sm"
+                                    : "text-[var(--modal-text-secondary)] hover:text-[var(--modal-text-primary)]"
+                                    }`}
+                            >
+                                {label}
+                            </button>
+                        ))}
+                    </div>
+                    {authMode === "password" ? (
+                        <div className="grid grid-cols-2 gap-[10px]">
+                            <div>
+                                <Label htmlFor="mx-username">Bot username</Label>
+                                <TextInput id="mx-username" value={usernameInput} onChange={setUsernameInput} placeholder="bot or @bot:example.com" monospace />
+                            </div>
+                            <div>
+                                <Label htmlFor="mx-password">Bot password</Label>
+                                <TextInput id="mx-password" value={passwordInput} onChange={setPasswordInput} placeholder="••••••••" monospace />
+                            </div>
+                        </div>
+                    ) : (
+                        <div>
+                            <Label htmlFor="mx-token">Access token</Label>
+                            <p className="text-[12px] text-[var(--modal-text-tertiary)] mb-[6px]">
+                                The token's session must have a device id — tokens from clients that log in
+                                without one (some SSO flows) are rejected, since the bridge needs a stable
+                                device identity.
+                            </p>
+                            <TextInput id="mx-token" value={tokenInput} onChange={setTokenInput} placeholder="syt_…" monospace />
+                        </div>
+                    )}
+                    {connectError && (
+                        <div className="px-[10px] py-[8px] rounded-[8px] bg-[var(--error-bg)] border border-[var(--error-border)] text-[12px] text-[var(--error)]">
+                            {connectError}
+                        </div>
+                    )}
+                    <div className="flex items-center gap-[8px]">
+                        <button
+                            type="button"
+                            onClick={handleConnect}
+                            disabled={connecting || !formReady}
+                            className="h-[36px] px-[16px] rounded-[8px] text-[13px] font-semibold text-white bg-[#006E51] hover:bg-[#005a43] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-[8px]"
+                        >
+                            {connecting && <Loader2 className="w-[13px] h-[13px] animate-spin" />}
+                            {connecting ? "Connecting…" : status?.has_token ? "Update connection" : "Connect"}
+                        </button>
+                        {status?.has_token && (
+                            <button
+                                type="button"
+                                onClick={() => { setShowForm(false); setConnectError(null); }}
+                                disabled={connecting}
+                                className="h-[36px] px-[14px] rounded-[8px] text-[13px] text-[var(--modal-text-secondary)] hover:bg-[var(--modal-bg-hover)] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                Cancel
+                            </button>
+                        )}
+                    </div>
+                </div>
+            )}
+
+            {status?.has_token && (
+                <div className="flex flex-col gap-[10px] px-[14px] py-[12px] rounded-[10px] border border-[var(--modal-border-secondary)] bg-[var(--modal-bg-tertiary)]">
+                    <div className="flex items-center justify-between gap-[12px]">
+                        <span className="text-[13px] font-medium text-[var(--modal-text-primary)]">Link a Matrix room</span>
+                        <button
+                            type="button"
+                            onClick={handleGeneratePairingCode}
+                            disabled={pairingLoading}
+                            className="h-[30px] px-[12px] rounded-[8px] text-[12px] font-medium text-white bg-[#006E51] hover:bg-[#005a43] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-[6px]"
+                        >
+                            {pairingLoading && <Loader2 className="w-[12px] h-[12px] animate-spin" />}
+                            {pairingLoading ? "Generating…" : activePairingCode ? "Generate new code" : "Generate pairing code"}
+                        </button>
+                    </div>
+                    <div>
+                        <button
+                            type="button"
+                            onClick={() => setHowToConnectOpen((open) => !open)}
+                            aria-expanded={howToConnectOpen}
+                            className="flex items-center gap-[4px] text-[12px] font-medium text-[var(--modal-text-secondary)] hover:text-[var(--modal-text-primary)] transition-colors cursor-pointer"
+                        >
+                            <ChevronRight className={`w-[12px] h-[12px] transition-transform ${howToConnectOpen ? "rotate-90" : ""}`} />
+                            How to connect
+                        </button>
+                        {howToConnectOpen && (
+                            <ul className="mt-[6px] pl-[16px] flex flex-col gap-[4px] text-[12px] text-[var(--modal-text-tertiary)] list-disc">
+                                <li>
+                                    Open a DM with the bot (or invite it into a room), then send{" "}
+                                    <span className="font-mono text-[var(--modal-text-secondary)]">!agent pair &lt;code&gt;</span>{" "}
+                                    in that conversation.
+                                </li>
+                                <li>The code is single-use and expires in 30 minutes.</li>
+                                <li>
+                                    Pair each DM and each room separately — generate a fresh code for every conversation you
+                                    want to authorize. Pairing also links your own account, so rooms you invite the bot to
+                                    later are accepted automatically.
+                                </li>
+                                <li>
+                                    In rooms, the agent only listens when addressed: @-mention the bot, reply to one of its
+                                    messages, or start the message with{" "}
+                                    <span className="font-mono text-[var(--modal-text-secondary)]">!agent</span>. DMs always
+                                    reach it.
+                                </li>
+                            </ul>
+                        )}
+                    </div>
+                    {pairingError && (
+                        <div className="px-[10px] py-[8px] rounded-[8px] bg-[var(--error-bg)] border border-[var(--error-border)] text-[12px] text-[var(--error)]">
+                            {pairingError}
+                        </div>
+                    )}
+                    {activePairingCode && (
+                        <div className="flex flex-col gap-[6px]">
+                            <div className="flex items-center gap-[8px]">
+                                <span className="font-mono text-[18px] font-semibold tracking-[0.08em] text-[var(--modal-text-primary)] select-all">
+                                    {activePairingCode.code}
+                                </span>
+                                <button
+                                    type="button"
+                                    onClick={() => handleCopyCode(activePairingCode.code)}
+                                    aria-label="Copy pairing code"
+                                    title={codeCopied ? "Copied" : "Copy code"}
+                                    className="p-[6px] rounded-[6px] text-[var(--modal-text-secondary)] hover:bg-[var(--modal-bg-hover)] transition-colors cursor-pointer"
+                                >
+                                    {codeCopied ? <Check className="w-[13px] h-[13px]" /> : <Copy className="w-[13px] h-[13px]" />}
+                                </button>
+                                <span className="text-[12px] text-[var(--modal-text-tertiary)]">{pairingExpiresLabel}</span>
+                            </div>
+                            <p className="text-[12px] text-[var(--modal-text-tertiary)]">
+                                In Matrix, send !agent pair {activePairingCode.code} to the bot to link this conversation.
+                            </p>
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {status?.has_token && (
+                <div className="flex flex-col gap-[8px]">
+                    <span className="text-[13px] font-medium text-[var(--modal-text-primary)]">Linked rooms</span>
+                    {unlinkError && (
+                        <div className="px-[10px] py-[8px] rounded-[8px] bg-[var(--error-bg)] border border-[var(--error-border)] text-[12px] text-[var(--error)]">
+                            {unlinkError}
+                        </div>
+                    )}
+                    {linkedRooms.length === 0 ? (
+                        <p className="text-[12px] text-[var(--modal-text-tertiary)]">
+                            No rooms linked yet — until you link one, the bot ignores all incoming messages.
+                        </p>
+                    ) : (
+                        <div className="flex flex-col gap-[6px]">
+                            {linkedRooms.map((roomId) => (
+                                <div
+                                    key={roomId}
+                                    className="flex items-center justify-between gap-[12px] px-[12px] py-[8px] rounded-[8px] border border-[var(--modal-border-secondary)] bg-[var(--modal-bg-tertiary)]"
+                                >
+                                    <span className="font-mono text-[13px] text-[var(--modal-text-primary)] break-all">{roomId}</span>
+                                    <button
+                                        type="button"
+                                        onClick={() => handleUnlinkRoom(roomId)}
+                                        disabled={unlinkingRoomId === roomId}
+                                        className="h-[26px] px-[10px] rounded-[8px] text-[12px] font-medium text-[#E01E5A] hover:bg-[var(--modal-bg-hover)] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-[6px] flex-shrink-0"
+                                    >
+                                        {unlinkingRoomId === roomId && <Loader2 className="w-[11px] h-[11px] animate-spin" />}
+                                        {unlinkingRoomId === roomId ? "Unlinking…" : "Unlink"}
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {status?.has_token && (
+                <p className="text-[12px] text-[var(--modal-text-tertiary)]">
+                    Once connected, every Matrix conversation that reaches this agent — each DM or paired
+                    room — gets its own dedicated thread, created automatically the first time a message
+                    arrives there and kept isolated from every other conversation.
                 </p>
             )}
         </div>

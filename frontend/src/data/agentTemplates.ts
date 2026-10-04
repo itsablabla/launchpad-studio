@@ -111,4 +111,42 @@ export const AGENT_TEMPLATES: Record<string, AgentTemplate> = {
     timeout_seconds: 30000,
     max_instances: 1,
   },
+  droid: {
+    provider: {
+      // `droid exec` headless mode. MCP delivery is file-based
+      // (.factory/mcp.json in the working directory, written by the backend);
+      // droid exits 2 on unrecognized flags, so --mcp-config must never be
+      // added here.
+      //
+      // Autonomy: `--skip-permissions-unsafe` runs every tool (shell writes,
+      // MCP calls, ...) without confirmation, which is the only mode that
+      // makes sense for an unattended chat agent — anything lower can stall a
+      // run waiting on an approval nobody can grant. Drop to `--auto low`
+      // in Advanced settings if you want a read-only agent instead.
+      //
+      // session_arg "-s" resumes the droid session captured from the
+      // previous turn's stream, so follow-up messages continue the
+      // conversation instead of cold-starting a stranger.
+      //
+      // no_output_timeout_ms is 90s, not the usual 30s: droid prints nothing
+      // until its MCP servers connect, and even a single slow server eats the
+      // 30s budget (verified empirically — a 30s watchdog killed the first
+      // run before the init event arrived). Launchpad's per-agent Factory
+      // home keeps the roster to one server, so 90s is generous.
+      command: "droid",
+      args: ["exec", "--output-format", "stream-json", "--skip-permissions-unsafe"],
+      normalizer: "droid",
+      output_format: "StreamJson",
+      input_mode: "Arg",
+      system_prompt_arg: "--append-system-prompt",
+      model_arg: "-m",
+      session_arg: "-s",
+      resume_args: [],
+      session_id_fields: ["session_id"],
+      clear_env: false,
+      no_output_timeout_ms: 90000,
+    },
+    timeout_seconds: 30000,
+    max_instances: 1,
+  },
 };

@@ -50,17 +50,10 @@ export function useProjectSSE(projectId: string | null): { connected: boolean } 
         const data = parsePayloadData(e.data);
         if (typeof data?.text === "string") {
           store().appendStreamingDelta(data.text as string);
-          // Drop classic (input-less lifecycle) tool chips on first text, but
-          // keep action-keyed chips — those close via their own *_completed events.
-          useChatStore.setState((state) => {
-            const current = state.inFlightByAgent.get(projectKey);
-            if (!current || current.activeToolCalls.length === 0) return state;
-            const filtered = current.activeToolCalls.filter((tc) => tc.action_id != null);
-            if (filtered.length === current.activeToolCalls.length) return state;
-            const next = new Map(state.inFlightByAgent);
-            next.set(projectKey, { ...current, activeToolCalls: filtered });
-            return { inFlightByAgent: next };
-          });
+          // Flush classic chips into the turn's persistent transcript
+          // (salvage, not delete), keep action-keyed chips — parity with the
+          // agent channel (useSSE.ts).
+          chatStore().flushClassicToolCalls(projectKey);
           chatStore().appendInFlightDelta(projectKey, data.text as string);
         }
       },
@@ -74,12 +67,20 @@ export function useProjectSSE(projectId: string | null): { connected: boolean } 
             tool: data.tool_name as string,
             input: data.tool_input as Record<string, unknown> | undefined,
             label: data.label as string | undefined,
+            toolUseId: data.tool_use_id as string | undefined,
           });
         }
       },
 
-      tool_call_completed() {
-        chatStore().markInFlightToolCallDone(projectKey);
+      tool_call_completed(e) {
+        const data = parsePayloadData(e.data);
+        // Same payload as the agent channel: output/isError persist onto the
+        // transcript row, toolUseId joins out-of-order parallel completions.
+        chatStore().markInFlightToolCallDone(projectKey, {
+          output: typeof data?.output === "string" ? data.output : data?.output != null ? JSON.stringify(data.output) : undefined,
+          isError: (data?.is_error as boolean | undefined) ?? undefined,
+          toolUseId: data?.tool_use_id as string | undefined,
+        });
       },
 
       tool_use_started(e) {

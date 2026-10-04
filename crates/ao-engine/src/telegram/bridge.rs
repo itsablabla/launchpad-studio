@@ -139,12 +139,20 @@ impl ChannelBridge {
         discord: Arc<DiscordTransport>,
         email: Arc<EmailTransport>,
         slack: Arc<SlackTransport>,
+        // Transports beyond the four named above, registered without a
+        // dedicated field — today: Matrix, which is feature-gated
+        // (`--no-default-features` builds pass an empty vec), so naming it
+        // here would push `cfg` noise into the signature and every caller.
+        additional_transports: Vec<Arc<dyn ChannelTransport>>,
     ) -> Self {
         let mut transports = ChannelTransportRegistry::new();
         transports.register(Arc::clone(&telegram) as Arc<dyn ChannelTransport>);
         transports.register(Arc::clone(&discord) as Arc<dyn ChannelTransport>);
         transports.register(email as Arc<dyn ChannelTransport>);
         transports.register(slack as Arc<dyn ChannelTransport>);
+        for transport in additional_transports {
+            transports.register(transport);
+        }
         Self {
             persistence,
             queue_registry,
@@ -308,9 +316,10 @@ impl ChannelBridge {
     /// per-binding tasks to match. A binding is eligible once it's enabled
     /// and its kind has a registered transport that reports a fingerprint
     /// (i.e. a resolvable secret) — and, for every kind except Discord,
-    /// Telegram, and Email, its `bridge_thread_id` has been provisioned too
+    /// Telegram, Email, and Matrix, its `bridge_thread_id` has been
+    /// provisioned too
     /// (agents mid-setup are skipped until enabling finishes provisioning
-    /// the thread). Discord, Telegram, and Email no longer need one: each
+    /// the thread). Those four no longer need one: each
     /// mints a fresh per-conversation thread on demand from its own inbound
     /// dispatch instead of routing every conversation through one
     /// eagerly-provisioned thread (see
@@ -342,9 +351,10 @@ impl ChannelBridge {
                 // here — `String::new()` stands in as their placeholder
                 // value purely for this map's shared shape, guarded (below
                 // and at start-up) by `is_empty()` so it's never registered
-                // as a meaningless real thread id. Every other kind (Slack)
+                // as a meaningless real thread id. Matrix follows the same
+                // mint-on-demand shape. Every other kind (Slack)
                 // still requires a real, provisioned value.
-                let bridge_thread_id = if matches!(binding.kind, ChannelKind::Discord | ChannelKind::Telegram | ChannelKind::Email) {
+                let bridge_thread_id = if matches!(binding.kind, ChannelKind::Discord | ChannelKind::Telegram | ChannelKind::Email | ChannelKind::Matrix) {
                     binding.bridge_thread_id.clone().unwrap_or_default()
                 } else {
                     let Some(bridge_thread_id) = binding.bridge_thread_id.clone() else {
@@ -489,6 +499,7 @@ impl ChannelBridge {
                 persistence: Arc::clone(&self.persistence),
                 queue_registry: Arc::clone(&self.queue_registry),
                 connection_state: Arc::clone(&self.connection_state),
+                owner_id: self.owner_id.clone(),
                 lease_gate: Arc::clone(&self.lease_gate),
                 event_bus: Arc::clone(&self.event_bus),
             };
@@ -659,6 +670,7 @@ mod tests {
             discord,
             email,
             slack,
+            Vec::new(),
         )
     }
 
@@ -710,6 +722,7 @@ mod tests {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: telegram_binding.into_iter().collect(),
             max_turns: None,

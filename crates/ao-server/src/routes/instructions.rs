@@ -147,6 +147,7 @@ mod tests {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
             enabled_launchpad_global_skills: None,

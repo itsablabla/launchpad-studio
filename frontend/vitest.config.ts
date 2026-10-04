@@ -4,6 +4,6 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     globals: true,
-    setupFiles: ["./src/test/setupFetchGuard.ts"],
+    setupFiles: ["./src/test/setupLocalStorage.ts", "./src/test/setupFetchGuard.ts"],
   },
 });

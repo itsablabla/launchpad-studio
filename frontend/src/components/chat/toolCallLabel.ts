@@ -1,5 +1,21 @@
 /** Shared tool-call chip label logic — imported by all chat surfaces. */
 
+/** One tool call in a turn's transcript, shared by the live in-flight view
+ *  (chatStore) and the persisted-history view (tool_use/tool_result
+ *  transcript pairing). Rendered by `ToolCallGroup`. */
+export interface ToolCallRecord {
+  /** `tool_use_id` when known (history always has it; live classic chips don't). */
+  id?: string;
+  tool: string;
+  input?: Record<string, unknown>;
+  output?: string;
+  isError?: boolean;
+  /** Wall-clock duration when known. */
+  elapsedMs?: number;
+  /** True while the call is still running (live view only). */
+  running?: boolean;
+}
+
 /** Strip MCP namespacing (`mcp__<server>__`) from a tool name so chips show
  *  the underlying tool rather than the transport. Handles nested forms like
  *  `mcp__launchpad__mcp__everything__echo` → `echo`. */
@@ -11,6 +27,18 @@ export function stripMcpPrefix(tool: string): string {
     s = s.slice(sep + 2);
   }
   return s;
+}
+
+/** Tool names that get their own richer rendering and must NOT also appear
+ *  as generic tool rows: forms become FormAnswerBubbles (preprocessFormToolPairs)
+ *  and ArtifactWrite renders as the inline artifact card. Applied everywhere a
+ *  ToolCallRecord is produced — live stamp, salvage paths, history pairing —
+ *  so the live view and the refetched view contain the same rows. */
+export const TOOL_ROW_SKIP = new Set(["AskUserQuestionWithForm", "ArtifactWrite"]);
+
+/** True when `tool` (MCP-qualified or bare) belongs to TOOL_ROW_SKIP. */
+export function isToolRowSkipped(tool: string): boolean {
+  return TOOL_ROW_SKIP.has(stripMcpPrefix(tool));
 }
 
 /** True for task/agent output files (e.g. `.../tasks/<id>/output...`). */
@@ -72,27 +100,34 @@ export function describeToolCall(
   const filePath = (input?.file_path as string) ?? (input?.path as string);
 
   if (tool === "Read") {
-    if (!filePath) return { label: "Reading" };
-    if (isAgentOutputPath(filePath)) return { label: "Reading agent output" };
-    return { label: `Reading ${truncate(filePath.split("/").pop() ?? filePath)}` };
+    const verb = completed ? "Read" : "Reading";
+    if (!filePath) return { label: verb };
+    if (isAgentOutputPath(filePath)) return { label: `${verb} agent output` };
+    return { label: `${verb} ${truncate(filePath.split("/").pop() ?? filePath)}` };
   }
 
-  if (tool === "Edit") {
-    if (!filePath) return { label: "Editing" };
-    return { label: `Editing ${truncate(filePath.split("/").pop() ?? filePath)}` };
+  // droid's patch tool is `ApplyPatch`; its Edit matches claude's.
+  if (tool === "Edit" || tool === "ApplyPatch") {
+    const verb = completed ? "Edited" : "Editing";
+    if (!filePath) return { label: verb };
+    return { label: `${verb} ${truncate(filePath.split("/").pop() ?? filePath)}` };
   }
 
-  if (tool === "Write") {
-    if (!filePath) return { label: "Creating" };
-    return { label: `Creating ${truncate(filePath.split("/").pop() ?? filePath)}` };
+  // droid's file-write tool is `Create` (claude's is `Write`).
+  if (tool === "Write" || tool === "Create") {
+    const verb = completed ? "Created" : "Creating";
+    if (!filePath) return { label: verb };
+    return { label: `${verb} ${truncate(filePath.split("/").pop() ?? filePath)}` };
   }
 
-  if (tool === "Bash") {
-    const desc = input?.description as string | undefined;
-    if (desc) return { label: `Running: ${truncate(desc)}` };
+  // droid's shell tool is `Execute` (claude's is `Bash`) — same labeling.
+  if (tool === "Bash" || tool === "Execute") {
+    const verb = completed ? "Ran" : "Running";
+    const desc = (input?.description as string | undefined) ?? (input?.summary as string | undefined);
+    if (desc) return { label: `${verb}: ${truncate(desc)}` };
     const cmd = input?.command as string | undefined;
-    if (cmd) return { label: `Running ${truncate(cmd.split("/").pop() ?? cmd)}` };
-    return { label: "Running" };
+    if (cmd) return { label: `${verb} ${truncate(cmd.split("/").pop() ?? cmd)}` };
+    return { label: verb };
   }
 
   if (tool === "Grep") {
@@ -126,7 +161,8 @@ export function describeToolCall(
     return { label: "Fetching" };
   }
 
-  if (tool === "ListDirectory") {
+  // droid's directory listing tool is `LS` (claude's is `ListDirectory`).
+  if (tool === "ListDirectory" || tool === "LS") {
     if (filePath) return { label: `Browsing ${truncate(filePath.split("/").pop() ?? filePath)}` };
     return { label: "Browsing" };
   }

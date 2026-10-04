@@ -105,6 +105,14 @@ pub struct AppState {
     /// directly on binding teardown, instead of waiting for the reconcile
     /// loop's next tick to notice.
     pub telegram_bridge: Arc<ChannelBridge>,
+    /// Direct handle to the Matrix transport, kept alongside (not instead
+    /// of) its registration in `telegram_bridge`'s transport registry — the
+    /// same reason `ChannelBridge.telegram` exists: `routes/matrix.rs`
+    /// needs kind-specific behavior the generic `ChannelTransport` trait
+    /// deliberately doesn't model (`invalidate_binding`,
+    /// `leave_room_best_effort`). Feature-gated like the transport itself.
+    #[cfg(feature = "matrix")]
+    pub matrix_transport: Arc<crate::channels::matrix::MatrixTransport>,
     /// `JoinHandle` for the channel bridge's reconcile-loop task — the same
     /// task that, once `telegram_bridge_shutdown` fires, releases every
     /// lease this process holds before it finishes. A
@@ -724,6 +732,17 @@ impl AppState {
         let discord_transport = Arc::new(DiscordTransport::new());
         let email_transport = Arc::new(EmailTransport::new());
         let slack_transport = Arc::new(SlackTransport::new());
+        // Matrix is feature-gated (guide/MATRIX_PLAN.md D1); with the feature
+        // off this is an empty vec and `ChannelBridge` never sees the kind.
+        // The transport also lands on `AppState::matrix_transport` so the
+        // matrix HTTP routes can reach its kind-specific methods.
+        #[cfg(feature = "matrix")]
+        let matrix_transport = Arc::new(crate::channels::matrix::MatrixTransport::new());
+        #[cfg(feature = "matrix")]
+        let additional_transports: Vec<Arc<dyn crate::channels::ChannelTransport>> =
+            vec![matrix_transport.clone()];
+        #[cfg(not(feature = "matrix"))]
+        let additional_transports: Vec<Arc<dyn crate::channels::ChannelTransport>> = Vec::new();
         let telegram_bridge = Arc::new(ChannelBridge::new(
             Arc::clone(&persistence),
             Arc::clone(&queue_managers),
@@ -732,6 +751,7 @@ impl AppState {
             discord_transport,
             email_transport,
             slack_transport,
+            additional_transports,
         ));
         let (telegram_bridge_shutdown, telegram_bridge_join_handle) = Arc::clone(&telegram_bridge).run();
 
@@ -800,6 +820,8 @@ impl AppState {
             schedule_runner_shutdown,
             telegram_bridge_shutdown,
             telegram_bridge,
+            #[cfg(feature = "matrix")]
+            matrix_transport,
             telegram_bridge_join_handle: Mutex::new(Some(telegram_bridge_join_handle)),
             agent_sleep_guard_shutdown,
             dispatch_watchdog_shutdown,
@@ -1237,6 +1259,17 @@ impl AppState {
         let discord_transport = Arc::new(DiscordTransport::new());
         let email_transport = Arc::new(EmailTransport::new());
         let slack_transport = Arc::new(SlackTransport::new());
+        // Matrix is feature-gated (guide/MATRIX_PLAN.md D1); with the feature
+        // off this is an empty vec and `ChannelBridge` never sees the kind.
+        // The transport also lands on `AppState::matrix_transport` so the
+        // matrix HTTP routes can reach its kind-specific methods.
+        #[cfg(feature = "matrix")]
+        let matrix_transport = Arc::new(crate::channels::matrix::MatrixTransport::new());
+        #[cfg(feature = "matrix")]
+        let additional_transports: Vec<Arc<dyn crate::channels::ChannelTransport>> =
+            vec![matrix_transport.clone()];
+        #[cfg(not(feature = "matrix"))]
+        let additional_transports: Vec<Arc<dyn crate::channels::ChannelTransport>> = Vec::new();
         let telegram_bridge = Arc::new(ChannelBridge::new(
             Arc::clone(&persistence),
             Arc::clone(&queue_managers),
@@ -1245,6 +1278,7 @@ impl AppState {
             discord_transport,
             email_transport,
             slack_transport,
+            additional_transports,
         ));
         let (telegram_bridge_shutdown, telegram_bridge_join_handle) = Arc::clone(&telegram_bridge).run();
 
@@ -1313,6 +1347,8 @@ impl AppState {
             schedule_runner_shutdown,
             telegram_bridge_shutdown,
             telegram_bridge,
+            #[cfg(feature = "matrix")]
+            matrix_transport,
             telegram_bridge_join_handle: Mutex::new(Some(telegram_bridge_join_handle)),
             agent_sleep_guard_shutdown,
             dispatch_watchdog_shutdown,

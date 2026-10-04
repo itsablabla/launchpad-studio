@@ -43,6 +43,16 @@ mail-parser = { version = "0.11.5", features = ["full_encoding"] }
 # (rustls-native-certs, which `imap`'s `rustls-connector` dependency already
 # carries independently of this crate's own direct TLS choice).
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Matrix channel (guide/MATRIX_PLAN.md D1): the SDK carries E2EE (vodozemac),
+# persistent sqlite stores, and rustls to match the workspace TLS stack.
+# Pinned minor: the SDK's API churns between minors.
+matrix-sdk = { version = "0.19.1", default-features = false, features = ["bundled-sqlite", "e2e-encryption", "rustls-aws-lc-rs", "markdown"], optional = true }
+
+[features]
+# `matrix` is default-on; `--no-default-features` builds skip the matrix-sdk
+# dep tree entirely (the transport module compiles away behind cfg).
+default = ["matrix"]
+matrix = ["dep:matrix-sdk"]
 
 [[bin]]
 name = "fixture_mcp_server"

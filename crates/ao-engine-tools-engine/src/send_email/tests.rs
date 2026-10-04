@@ -67,6 +67,7 @@ fn make_profile(id: &str, channels: Vec<ChannelBinding>) -> AgentProfile {
         persona: None,
         special_instructions: None,
         legacy_system_prompt: None,
+        minimal_prompt: None,
         max_delegation_depth: None,
         channels,
         max_turns: None,

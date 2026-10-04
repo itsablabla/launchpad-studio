@@ -2160,3 +2160,408 @@ fn agy_stream_json_end_to_end_with_tools_usage_sole_source_and_correlated_ids() 
         final_events
     );
 }
+
+// --- DroidNormalizer tests ---
+
+fn make_droid_config(output_format: OutputFormat) -> CliProviderConfig {
+    CliProviderConfig {
+        command: "droid".to_string(),
+        args: vec![
+            "exec".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--auto".to_string(),
+            "low".to_string(),
+        ],
+        normalizer: Some("droid".to_string()),
+        output_format,
+        input_mode: InputMode::Arg,
+        model_arg: Some("-m".to_string()),
+        model_aliases: std::collections::HashMap::new(),
+        system_prompt_arg: Some("--append-system-prompt".to_string()),
+        session_arg: None,
+        resume_args: vec![],
+        session_id_fields: vec!["session_id".to_string()],
+        clear_env: false,
+        no_output_timeout_ms: 30000,
+        file_capabilities: None,
+    }
+}
+
+/// Events captured verbatim from `droid exec --output-format stream-json`
+/// (droid 0.232.0): a turn with reasoning (emitted twice), one tool call,
+/// and a completion carrying usage.
+const DROID_STREAM_FIXTURE: &str = concat!(
+    r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"sess-1","tools":[]}"#, "\n",
+    r#"{"type":"message","role":"user","id":"u1","text":"hi","session_id":"sess-1"}"#, "\n",
+    r#"{"type":"reasoning","id":"r1","text":"Thinking hard.","session_id":"sess-1"}"#, "\n",
+    r#"{"type":"reasoning","id":"r1","text":"Thinking hard.","session_id":"sess-1"}"#, "\n",
+    r#"{"type":"tool_call","id":"call_1","toolId":"Execute","toolName":"Execute","parameters":{"command":"echo hi"},"session_id":"sess-1"}"#, "\n",
+    r#"{"type":"tool_result","id":"call_1","toolId":"Execute","isError":false,"value":"hi\n","session_id":"sess-1"}"#, "\n",
+    r#"{"type":"message","role":"assistant","id":"a1","text":"Done.","session_id":"sess-1"}"#, "\n",
+    r#"{"type":"completion","finalText":"Done.","numTurns":2,"session_id":"sess-1","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":50,"cache_creation_input_tokens":10}}"#, "\n",
+);
+
+#[test]
+fn registry_creates_droid_normalizer_for_droid_command() {
+    let registry = NormalizerRegistry::new();
+    let config = make_droid_config(OutputFormat::StreamJson);
+
+    let mut normalizer = registry.create("droid", &config);
+    let events = normalizer.process_chunk(
+        "{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"a1\",\"text\":\"hi\"}\n",
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEventPayload::TextDelta { text } if text == "hi")),
+        "droid command must route to DroidNormalizer, got {:?}",
+        events
+    );
+}
+
+#[test]
+fn droid_stream_full_turn_maps_all_event_kinds() {
+    let config = make_droid_config(OutputFormat::StreamJson);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+
+    let mut events = Vec::new();
+    events.extend(normalizer.process_chunk(DROID_STREAM_FIXTURE));
+    events.extend(normalizer.finalize(Some(0), ""));
+
+    // session id from the init event
+    assert_eq!(normalizer.extract_session_id(), Some("sess-1".to_string()));
+
+    // user-prompt echo never renders as agent output
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEventPayload::TextDelta { text } if text == "hi")),
+        "the user-role message echo must be suppressed: {:?}",
+        events
+    );
+
+    // reasoning: started once, one delta, ended once (the duplicate
+    // `reasoning` line for id r1 must not double-emit)
+    let thinking_starts = events
+        .iter()
+        .filter(|e| matches!(e, AgentEventPayload::ThinkingStarted))
+        .count();
+    let thinking_deltas: Vec<&AgentEventPayload> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEventPayload::ThinkingDelta { .. }))
+        .collect();
+    let thinking_ends = events
+        .iter()
+        .filter(|e| matches!(e, AgentEventPayload::ThinkingEnded { .. }))
+        .count();
+    assert_eq!(thinking_starts, 1, "events: {:?}", events);
+    assert_eq!(thinking_deltas.len(), 1, "events: {:?}", events);
+    assert!(
+        matches!(thinking_deltas[0], AgentEventPayload::ThinkingDelta { text } if text == "Thinking hard.")
+    );
+    assert_eq!(thinking_ends, 1, "events: {:?}", events);
+
+    // tool call paired with its result under the shared id and real name
+    let started: Vec<&AgentEventPayload> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEventPayload::ToolCallStarted { .. }))
+        .collect();
+    assert_eq!(started.len(), 1);
+    assert!(
+        matches!(started[0], AgentEventPayload::ToolCallStarted { tool_name, tool_use_id, .. } if tool_name == "Execute" && tool_use_id.as_deref() == Some("call_1"))
+    );
+    let completed: Vec<&AgentEventPayload> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEventPayload::ToolCallCompleted { .. }))
+        .collect();
+    assert_eq!(completed.len(), 1);
+    assert!(
+        matches!(completed[0], AgentEventPayload::ToolCallCompleted { tool_name, output, tool_use_id, is_error }
+            if tool_name == "Execute" && output.as_deref() == Some("hi\n")
+               && tool_use_id.as_deref() == Some("call_1") && !is_error)
+    );
+
+    // assistant text streams as a delta and completes with the same text
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEventPayload::TextDelta { text } if text == "Done."))
+    );
+    let completes: Vec<&AgentEventPayload> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEventPayload::TextComplete { .. }))
+        .collect();
+    assert_eq!(completes.len(), 1);
+    assert!(matches!(completes[0], AgentEventPayload::TextComplete { text } if text == "Done."));
+
+    // usage read off the completion event
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEventPayload::Usage { input_tokens, output_tokens, cache_read_tokens, .. }
+            if *input_tokens == 100 && *output_tokens == 20 && *cache_read_tokens == 50)),
+        "usage from the completion event must be forwarded: {:?}",
+        events
+    );
+}
+
+#[test]
+fn droid_stream_assistant_message_dedup_and_snapshot_growth() {
+    let config = make_droid_config(OutputFormat::StreamJson);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+
+    // Same id emitted three times: snapshot, grown snapshot, exact duplicate.
+    let events = normalizer.process_chunk(concat!(
+        r#"{"type":"message","role":"assistant","id":"a1","text":"Hello"}"#, "\n",
+        r#"{"type":"message","role":"assistant","id":"a1","text":"Hello there"}"#, "\n",
+        r#"{"type":"message","role":"assistant","id":"a1","text":"Hello there"}"#, "\n",
+    ));
+    let deltas: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEventPayload::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deltas,
+        vec!["Hello".to_string(), " there".to_string()],
+        "duplicate snapshot must be dropped and growth must emit only the suffix"
+    );
+
+    let final_events = normalizer.finalize(Some(0), "");
+    assert!(
+        matches!(&final_events[0], AgentEventPayload::TextComplete { text } if text == "Hello there"),
+        "TextComplete must carry the accumulated text exactly once: {:?}",
+        final_events
+    );
+}
+
+#[test]
+fn droid_json_mode_result_and_usage() {
+    let config = make_droid_config(OutputFormat::Json);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+
+    // --output-format json emits one blob at exit; nothing streams.
+    assert!(normalizer
+        .process_chunk(r#"{"type":"result","subtype":"success","is_error":false,"result":"the answer","session_id":"sess-9","usage":{"input_tokens":10,"output_tokens":5}}"#)
+        .is_empty());
+
+    let events = normalizer.finalize(Some(0), "");
+    assert!(
+        matches!(&events[0], AgentEventPayload::TextComplete { text } if text == "the answer"),
+        "json mode must read the top-level `result` string: {:?}",
+        events
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEventPayload::Usage { input_tokens, .. } if *input_tokens == 10))
+    );
+    assert_eq!(normalizer.extract_session_id(), Some("sess-9".to_string()));
+}
+
+#[test]
+fn droid_finalize_with_stderr_produces_error() {
+    let config = make_droid_config(OutputFormat::StreamJson);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+
+    let events = normalizer.finalize(Some(2), "error: unrecognized argument");
+    assert_eq!(events.len(), 1);
+    assert!(
+        matches!(&events[0], AgentEventPayload::Error { message, recoverable } if message == "error: unrecognized argument" && !recoverable)
+    );
+}
+
+#[test]
+fn droid_stream_error_event_surfaces_message() {
+    let config = make_droid_config(OutputFormat::StreamJson);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+
+    // Shape observed from droid 0.129.0 exiting 1 right after init; the
+    // arm must surface the message instead of dropping the event.
+    let events = normalizer.process_chunk(
+        "{\"type\":\"error\",\"message\":\"Failed to create cloud session: 401\"}\n",
+    );
+    assert_eq!(events.len(), 1);
+    assert!(
+        matches!(&events[0], AgentEventPayload::Error { message, recoverable } if message == "Failed to create cloud session: 401" && !recoverable)
+    );
+
+    // Object-shaped `error` field instead of a `message` string.
+    let events = normalizer.process_chunk(
+        "{\"type\":\"error\",\"error\":{\"code\":\"session_expired\"}}\n",
+    );
+    assert!(
+        matches!(&events[0], AgentEventPayload::Error { message, .. } if message.contains("session_expired")),
+        "object error fields must serialize into the message: {events:?}"
+    );
+}
+
+#[test]
+fn droid_inline_thinking_routes_to_thinking_channel() {
+    // generic-chat-completion-api gateways embed reasoning as
+    // `<thinking>…</thinking>` inside the assistant message text instead of
+    // producing structured `reasoning` events (observed with a custom
+    // OpenAI-compatible endpoint on droid 0.232.0).
+    let config = make_droid_config(OutputFormat::StreamJson);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+
+    let events = normalizer.process_chunk(
+        "{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m1\",\"text\":\"<thinking>let me check the codeword</thinking>Model: Garza Auto. Codeword: PAPAYA-77.\"}\n",
+    );
+    assert!(matches!(events[0], AgentEventPayload::ThinkingStarted));
+    assert!(
+        matches!(&events[1], AgentEventPayload::ThinkingDelta { text } if text == "let me check the codeword"),
+        "events: {events:?}"
+    );
+    assert!(
+        matches!(&events[2], AgentEventPayload::ThinkingEnded { .. }),
+        "thinking must close before visible text: {events:?}"
+    );
+    assert!(
+        matches!(&events[3], AgentEventPayload::TextDelta { text } if text == "Model: Garza Auto. Codeword: PAPAYA-77."),
+        "events: {events:?}"
+    );
+
+    // Finalized output carries only the visible text.
+    let final_events = normalizer.finalize(Some(0), "");
+    assert!(
+        matches!(&final_events[0], AgentEventPayload::TextComplete { text } if text == "Model: Garza Auto. Codeword: PAPAYA-77."),
+        "final: {final_events:?}"
+    );
+}
+
+#[test]
+fn droid_inline_thinking_unclosed_tag_withheld_until_snapshot_closes_it() {
+    let config = make_droid_config(OutputFormat::StreamJson);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+
+    // Snapshot 1: opener with no closer yet — the tail is withheld, the
+    // pre-tag text still renders.
+    let events = normalizer.process_chunk(
+        "{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m1\",\"text\":\"Working on it. <thinking>step one\"}\n",
+    );
+    let deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEventPayload::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, vec!["Working on it. "], "events: {events:?}");
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEventPayload::ThinkingDelta { .. })),
+        "unclosed thinking must not stream yet: {events:?}"
+    );
+
+    // Snapshot 2 (growth): the tag closes and visible text continues.
+    let events = normalizer.process_chunk(
+        "{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m1\",\"text\":\"Working on it. <thinking>step one, step two</thinking> Done.\"}\n",
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEventPayload::ThinkingDelta { text } if text == "step one, step two")),
+        "events: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEventPayload::TextDelta { text } if text == " Done.")),
+        "only the post-tag suffix is new visible text: {events:?}"
+    );
+
+    let final_events = normalizer.finalize(Some(0), "");
+    assert!(
+        matches!(&final_events[0], AgentEventPayload::TextComplete { text } if text == "Working on it.  Done."),
+        "final: {final_events:?}"
+    );
+}
+
+#[test]
+fn droid_tools_in_flight_counter_tracks_call_boundaries() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let config = make_droid_config(OutputFormat::StreamJson);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+    let counter = Arc::new(AtomicUsize::new(0));
+    normalizer.set_tools_in_flight_counter(Arc::clone(&counter));
+
+    normalizer.process_chunk(
+        "{\"type\":\"tool_call\",\"id\":\"c1\",\"toolName\":\"Execute\",\"parameters\":{}}\n",
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+    normalizer.process_chunk(
+        "{\"type\":\"tool_result\",\"id\":\"c1\",\"isError\":false,\"value\":\"ok\"}\n",
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+    // A result with no matching call must not underflow the counter.
+    normalizer.process_chunk(
+        "{\"type\":\"tool_result\",\"id\":\"orphan\",\"isError\":true,\"value\":\"boom\"}\n",
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn droid_duplicate_tool_call_is_deduped() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let config = make_droid_config(OutputFormat::StreamJson);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+    let counter = Arc::new(AtomicUsize::new(0));
+    normalizer.set_tools_in_flight_counter(Arc::clone(&counter));
+
+    let line = "{\"type\":\"tool_call\",\"id\":\"c1\",\"toolName\":\"Execute\",\"parameters\":{}}\n";
+    let first = normalizer.process_chunk(line);
+    let second = normalizer.process_chunk(line);
+
+    let starts = |events: &[AgentEventPayload]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEventPayload::ToolCallStarted { .. }))
+            .count()
+    };
+    assert_eq!(starts(&first), 1);
+    assert_eq!(starts(&second), 0, "duplicate id must not re-announce");
+    // …and must not leak the watchdog-pause counter.
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+    // The matching result still resolves the single in-flight call.
+    normalizer.process_chunk(
+        "{\"type\":\"tool_result\",\"id\":\"c1\",\"isError\":false,\"value\":\"ok\"}\n",
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn droid_finalize_flushes_withheld_unclosed_thinking_tail() {
+    let config = make_droid_config(OutputFormat::StreamJson);
+    let mut normalizer = crate::droid::DroidNormalizer::new(&config);
+
+    // The gateway embeds reasoning inline but the stream ends before the
+    // closer arrives — the tail must surface (as thinking) rather than be
+    // destroyed.
+    normalizer.process_chunk(
+        "{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m1\",\"text\":\"Working on it. <thinking>step one, step two\"}\n",
+    );
+    let final_events = normalizer.finalize(Some(0), "");
+
+    assert!(
+        final_events
+            .iter()
+            .any(|e| matches!(e, AgentEventPayload::ThinkingDelta { text } if text == "step one, step two")),
+        "withheld tail flushed at finalize: {final_events:?}"
+    );
+    // Thinking channel opened and closed around the flush.
+    assert!(
+        final_events
+            .iter()
+            .any(|e| matches!(e, AgentEventPayload::ThinkingStarted)),
+        "final: {final_events:?}"
+    );
+    assert!(
+        final_events
+            .iter()
+            .any(|e| matches!(e, AgentEventPayload::ThinkingEnded { .. })),
+        "final: {final_events:?}"
+    );
+    // Visible text still completes normally, without the reasoning tail.
+    assert!(
+        final_events
+            .iter()
+            .any(|e| matches!(e, AgentEventPayload::TextComplete { text } if text == "Working on it. ")),
+        "final: {final_events:?}"
+    );
+}

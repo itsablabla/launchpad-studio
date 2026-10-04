@@ -314,6 +314,99 @@ describe("AgentProfileModal — single Save persists deltas across tabs", () => 
     });
 });
 
+describe("AgentProfileModal — server-owned fields survive an unrelated save", () => {
+    // The PUT replaces the whole profile server-side and every omitted field
+    // resets to its serde default, so every field the modal doesn't edit must
+    // be carried through explicitly. A bare rename must not wipe plugin/skill
+    // enablement, API-mode tunables, the delegate depth cap, the team link,
+    // the AgentAuthor undo buffer, or the provider's resume/file-capability
+    // wiring.
+    let container: HTMLDivElement;
+    let root: ReturnType<typeof createRoot>;
+
+    beforeEach(() => {
+        container = document.createElement("div");
+        document.body.appendChild(container);
+        root = createRoot(container);
+    });
+
+    afterEach(async () => {
+        await act(async () => { root.unmount(); });
+        document.body.removeChild(container);
+    });
+
+    it("carries every non-edited field through the PUT payload", async () => {
+        const initial = pristineProfile({
+            serialize: false,
+            minimal_prompt: true,
+            enabled_plugins: { superpowers: { enabled: true } },
+            enabled_launchpad_global_skills: ["deep-review"],
+            enabled_launchpad_project_skills: { "proj-1": ["ship"] },
+            thinking: { type: "adaptive" } as unknown as AgentProfile["thinking"],
+            max_output_tokens: 8192,
+            max_context_tokens: 64000,
+            reasoning_effort: "high" as unknown as AgentProfile["reasoning_effort"],
+            max_delegation_depth: 3,
+            owning_team_id: "team-9",
+            legacy_system_prompt: "the old prompt",
+            provider: {
+                ...pristineProfile().provider,
+                session_id_fields: ["session_id"],
+                file_capabilities: {
+                    supported: true,
+                    max_file_size_bytes: 1048576,
+                    max_attachments_per_message: 3,
+                    allowed_mime_types: ["image/png"],
+                    image_mode: { type: "file_reference", instruction_template: "see {path}" },
+                },
+            },
+        });
+        const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+        await act(async () => {
+            root.render(
+                React.createElement(AgentProfileModal, {
+                    open: true,
+                    initial,
+                    onClose: () => {},
+                    onSubmit,
+                }),
+            );
+        });
+        await act(async () => { await Promise.resolve(); });
+
+        // Dirty the form via an unrelated field — the bug's trigger is an
+        // edit that has nothing to do with any of these fields.
+        await act(async () => {
+            setValue(container.querySelector("#ae-name") as HTMLInputElement, "Renamed Assistant");
+        });
+
+        const saveButton = findButton(container, "Save Changes")!;
+        expect(saveButton.disabled).toBe(false);
+        await act(async () => {
+            saveButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        });
+        await act(async () => { await Promise.resolve(); });
+
+        expect(onSubmit).toHaveBeenCalledTimes(1);
+        const submitted = onSubmit.mock.calls[0][0] as AgentProfile;
+        expect(submitted.serialize).toBe(false);
+        expect(submitted.minimal_prompt).toBe(true);
+        expect(submitted.enabled_plugins).toEqual({ superpowers: { enabled: true } });
+        expect(submitted.enabled_launchpad_global_skills).toEqual(["deep-review"]);
+        expect(submitted.enabled_launchpad_project_skills).toEqual({ "proj-1": ["ship"] });
+        expect(submitted.thinking).toEqual({ type: "adaptive" });
+        expect(submitted.max_output_tokens).toBe(8192);
+        expect(submitted.max_context_tokens).toBe(64000);
+        expect(submitted.reasoning_effort).toBe("high");
+        expect(submitted.max_delegation_depth).toBe(3);
+        expect(submitted.owning_team_id).toBe("team-9");
+        expect(submitted.legacy_system_prompt).toBe("the old prompt");
+        expect(submitted.provider.session_id_fields).toEqual(["session_id"]);
+        expect(submitted.provider.file_capabilities).toMatchObject({ supported: true });
+    });
+});
+
 describe("AgentProfileModal — Max Turns control (native-runner turn cap)", () => {
     let container: HTMLDivElement;
     let root: ReturnType<typeof createRoot>;

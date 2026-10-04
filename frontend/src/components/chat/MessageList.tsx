@@ -24,7 +24,7 @@ import { AsyncFormRequestCard } from "./AsyncFormRequestCard";
 import { FormDismissedIndicator } from "./FormDismissedIndicator";
 import { FormWithdrawnIndicator } from "./FormWithdrawnIndicator";
 import { FormActionIndicator } from "./FormActionIndicator";
-import { stripMcpPrefix } from "./toolCallLabel";
+import { stripMcpPrefix, isToolRowSkipped, type ToolCallRecord } from "./toolCallLabel";
 import type { FormRequestPayload, FormAnswerMap, FormFieldDef, FormOptionDef, AsyncFormRequestMeta, AsyncFormAnswerMeta, AsyncFormSpec, FormAction } from "../../types/form";
 
 export type VirtualItemData =
@@ -45,6 +45,11 @@ export type VirtualItemData =
        *  `ArtifactWrite` tool_result scan — see `extractArtifactWriteResults`).
        *  Rendered as one `ArtifactCardTile` per id, deduped by id. */
       artifactIds?: string[];
+      /** The turn's tool-call transcript (droid-TUI-style collapsed rows).
+       *  Sourced from `entry.metadata.tool_calls` (the live-finalized stamp —
+       *  see `finalizeInFlightText`) and/or `extractToolCallsByTurn` (the
+       *  persisted tool_use/tool_result pairing). */
+      toolCalls?: ToolCallRecord[];
     }
   | { type: "streaming"; prefixSegments?: CoalescedSegment[] };
 
@@ -211,6 +216,70 @@ function getTurnId(entry: TranscriptEntry): string | undefined {
   return typeof tid === "string" ? tid : undefined;
 }
 
+/** Tool names that get their own richer rendering and must NOT also appear
+ *  as generic tool rows: forms become FormAnswerBubbles (preprocessFormToolPairs)
+ *  and ArtifactWrite renders as the inline artifact card. The canonical set
+ *  lives in `toolCallLabel.ts` (shared with the live-stamp/salvage paths) —
+ *  `isToolRowSkipped` is the predicate. */
+
+/** Reads the client-only `metadata.tool_calls` stamp `finalizeInFlightText`
+ *  puts on a just-finalized live reply — the same shape `ToolCallGroup`
+ *  renders. A fresh transcript fetch never carries this field; on reload the
+ *  same calls come back through `extractToolCallsByTurn` below. */
+function entryStampedToolCalls(entry: TranscriptEntry): ToolCallRecord[] | undefined {
+  const md = entry.metadata as Record<string, unknown> | null | undefined;
+  const calls = md?.tool_calls;
+  if (!Array.isArray(calls) || calls.length === 0) return undefined;
+  return calls.filter((c): c is ToolCallRecord => !!c && typeof (c as ToolCallRecord).tool === "string");
+}
+
+/** Pair persisted `tool_use`/`tool_result` transcript entries into per-turn
+ *  tool-call records — the reload/historical half of the droid-TUI-style tool
+ *  transcript. Mirrors `extractArtifactWriteResults`'s correlation: results
+ *  carry no `tool_name`, so pairing goes through the `tool_use` entry's
+ *  `tool_use_id`. Pure — safe to unit test and to call from a `useMemo`. */
+export function extractToolCallsByTurn(messages: TranscriptEntry[]): Map<string, ToolCallRecord[]> {
+  const resultByUseId = new Map<string, TranscriptEntry>();
+  for (const entry of messages) {
+    if (entry.event_type !== "tool_result") continue;
+    const md = entry.metadata as Record<string, unknown> | null | undefined;
+    const useId = md?.tool_use_id;
+    if (typeof useId === "string") resultByUseId.set(useId, entry);
+  }
+
+  const byTurn = new Map<string, ToolCallRecord[]>();
+  for (const entry of messages) {
+    if (entry.event_type !== "tool_use") continue;
+    const md = entry.metadata as Record<string, unknown> | null | undefined;
+    const toolName = md?.tool_name;
+    const useId = md?.tool_use_id;
+    const turnId = md?.turn_id;
+    if (typeof toolName !== "string" || typeof useId !== "string" || typeof turnId !== "string") continue;
+    if (isToolRowSkipped(toolName)) continue;
+
+    const result = resultByUseId.get(useId);
+    const resultMd = result?.metadata as Record<string, unknown> | null | undefined;
+    const rawOutput = resultMd?.output ?? result?.content;
+    const elapsed =
+      result != null
+        ? new Date(result.ts).getTime() - new Date(entry.ts).getTime()
+        : NaN;
+    const record: ToolCallRecord = {
+      id: useId,
+      tool: toolName,
+      input: (md?.input as Record<string, unknown> | undefined) ?? undefined,
+      output: typeof rawOutput === "string" ? rawOutput : rawOutput != null ? JSON.stringify(rawOutput) : undefined,
+      isError: (resultMd?.is_error as boolean | undefined) ?? undefined,
+      // Guard against unparseable timestamps — NaN would render as "NaNms".
+      elapsedMs: Number.isFinite(elapsed) ? Math.max(0, elapsed) : undefined,
+    };
+    const list = byTurn.get(turnId) ?? [];
+    list.push(record);
+    byTurn.set(turnId, list);
+  }
+  return byTurn;
+}
+
 /** Reads the client-only `metadata.artifact_ids` field `finalizeInFlightText`
  *  stamps onto a just-finalized live reply (see chatStore) — the snapshot of
  *  whatever `appendInFlightArtifactId` collected while that turn streamed.
@@ -322,11 +391,13 @@ export interface BuildMessageItemsResult {
  * "load older" page crossing the boundary), and never re-fires for messages
  * purely on one side of it. */
 const EMPTY_IDS_BY_TURN_ID: Map<string, string[]> = new Map();
+const EMPTY_CALLS_BY_TURN_ID: Map<string, ToolCallRecord[]> = new Map();
 
 export function buildMessageItems(
   messages: TranscriptEntry[],
   historyFloorTs?: string | null,
-  idsByTurnId: Map<string, string[]> = EMPTY_IDS_BY_TURN_ID
+  idsByTurnId: Map<string, string[]> = EMPTY_IDS_BY_TURN_ID,
+  toolCallsByTurn: Map<string, ToolCallRecord[]> = EMPTY_CALLS_BY_TURN_ID
 ): BuildMessageItemsResult {
   const floorMs = historyFloorTs ? new Date(historyFloorTs).getTime() : null;
   // Union of an entry's own client-stamped ids (live-finalized replies) and
@@ -337,6 +408,31 @@ export function buildMessageItems(
     const persisted = turnId ? idsByTurnId.get(turnId) ?? [] : [];
     const live = entryArtifactIds(entry);
     return persisted.length === 0 ? live : live.length === 0 ? persisted : [...persisted, ...live];
+  };
+  // Same union for the tool-call transcript: the live-finalized stamp
+  // (`metadata.tool_calls`) covers the window before the next refetch, the
+  // persisted tool_use/tool_result pairing covers history. When both exist
+  // for one entry they describe the same calls — prefer the stamped list
+  // (it has live elapsed times) and don't concatenate.
+  const toolCallsForEntry = (entry: TranscriptEntry): ToolCallRecord[] | undefined => {
+    const stamped = entryStampedToolCalls(entry);
+    if (stamped) return stamped;
+    const turnId = getTurnId(entry);
+    return turnId ? toolCallsByTurn.get(turnId) : undefined;
+  };
+  const mergeToolCalls = (
+    existing: ToolCallRecord[] | undefined,
+    extra: ToolCallRecord[] | undefined
+  ): ToolCallRecord[] | undefined => {
+    if (!extra || extra.length === 0) return existing;
+    if (!existing || existing.length === 0) return extra;
+    const seen = new Set(existing.map((c) => c.id).filter(Boolean));
+    const merged = [...existing];
+    for (const c of extra) {
+      if (c.id && seen.has(c.id)) continue;
+      merged.push(c);
+    }
+    return merged;
   };
   // Pass 1: attach skill-load chips to the next non-hidden, non-tool-turn
   // visible message index. Hidden skill-loads with no following visible
@@ -411,6 +507,7 @@ export function buildMessageItems(
       }
       prevItem.coalescedSegments = segments;
       prevItem.artifactIds = mergeArtifactIds(prevItem.artifactIds, idsForEntry(entry));
+      prevItem.toolCalls = mergeToolCalls(prevItem.toolCalls, toolCallsForEntry(entry));
       // `entry` folded into prevItem's row rather than getting its own —
       // reattach the divider to that row so the transition isn't silently
       // dropped (see the `historyFloorTs` doc comment above).
@@ -452,6 +549,7 @@ export function buildMessageItems(
         prevItem.coalescedSegments = segments;
       }
       prevItem.artifactIds = mergeArtifactIds(prevItem.artifactIds, idsForEntry(entry));
+      prevItem.toolCalls = mergeToolCalls(prevItem.toolCalls, toolCallsForEntry(entry));
       if (showForkDivider) prevItem.showForkDivider = true;
       continue;
     }
@@ -480,6 +578,7 @@ export function buildMessageItems(
         coalescedSegments: segments,
         showForkDivider,
         artifactIds: mergeArtifactIds(undefined, idsForEntry(entry)),
+        toolCalls: toolCallsForEntry(entry),
       });
       continue;
     }
@@ -493,6 +592,7 @@ export function buildMessageItems(
       groupWithPrevious,
       showForkDivider,
       artifactIds: mergeArtifactIds(undefined, idsForEntry(entry)),
+      toolCalls: toolCallsForEntry(entry),
     });
   }
 
@@ -549,9 +649,13 @@ function estimateMessageHeight(item: VirtualItemData): number {
   } else {
     textLen = item.entry.content?.length ?? 0;
   }
-  if (textLen < 100) return separatorHeight + 72 + groupedAdjust + chipAdjust;
-  if (textLen < 500) return separatorHeight + 160 + groupedAdjust + chipAdjust;
-  return separatorHeight + 280 + groupedAdjust + chipAdjust;
+  // Tool-call rows start collapsed: ≤3 render as ~22px rows, longer runs
+  // behind a single "N tool calls" header.
+  const toolCallCount = item.toolCalls?.length ?? 0;
+  const toolAdjust = toolCallCount === 0 ? 0 : toolCallCount <= 3 ? toolCallCount * 22 + 8 : 30;
+  if (textLen < 100) return separatorHeight + 72 + groupedAdjust + chipAdjust + toolAdjust;
+  if (textLen < 500) return separatorHeight + 160 + groupedAdjust + chipAdjust + toolAdjust;
+  return separatorHeight + 280 + groupedAdjust + chipAdjust + toolAdjust;
 }
 
 /** Defensive cap on consecutive auto-triggered older-page fetches while the
@@ -881,6 +985,11 @@ export function MessageList() {
     artifactStubs.forEach(registerCard);
   }, [artifactStubs]);
 
+  // Reload/historical half of the tool-call transcript: pair persisted
+  // tool_use/tool_result entries into per-turn records once per `messages`
+  // change (same correlation pattern as the artifact scan above).
+  const toolCallsByTurn = useMemo(() => extractToolCallsByTurn(messages), [messages]);
+
   // Build flat virtual item list.
   //
   // Pure pass (`buildMessageItems`) handles three coalesce shapes: skill-load
@@ -891,7 +1000,8 @@ export function MessageList() {
     const { items: messageItems, orphanChips } = buildMessageItems(
       preprocessFormToolPairs(messages),
       historyFloorTs,
-      idsByTurnId
+      idsByTurnId,
+      toolCallsByTurn
     );
     const items: VirtualItemData[] = [...messageItems];
 
@@ -1635,6 +1745,7 @@ export function MessageList() {
                         coalescedSegments={item.coalescedSegments}
                         allowBranch={allowBranch}
                         artifactIds={item.artifactIds}
+                        toolCalls={item.toolCalls}
                       />
                     </div>
                   )}

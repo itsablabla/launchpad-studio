@@ -18,6 +18,10 @@ describe("validateProviderArgs — shipped default templates", () => {
     it("agy template validates clean", () => {
         expect(validateProviderArgs(AGENT_TEMPLATES.agy.provider.command, AGENT_TEMPLATES.agy.provider.args)).toEqual([]);
     });
+
+    it("droid template validates clean", () => {
+        expect(validateProviderArgs(AGENT_TEMPLATES.droid.provider.command, AGENT_TEMPLATES.droid.provider.args)).toEqual([]);
+    });
 });
 
 describe("validateProviderArgs — cross-contamination detection", () => {
@@ -69,6 +73,25 @@ describe("validateProviderArgs — cross-contamination detection", () => {
         expect(warnings).toHaveLength(1);
         expect(warnings[0]).toContain("--conversation");
         expect(warnings[0]).toContain("agy");
+    });
+
+    it("flags --mcp-config pasted into a droid profile (droid exits 2 on unrecognized flags)", () => {
+        const warnings = validateProviderArgs("droid", ["exec", "--output-format", "stream-json", "--mcp-config", "/tmp/x.json"]);
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toContain("--mcp-config");
+        expect(warnings[0]).toContain("exits 2");
+    });
+
+    it("flags a droid-only flag (--auto) pasted into a claude profile", () => {
+        const warnings = validateProviderArgs("claude", ["--print", "--auto", "low"]);
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toContain("--auto");
+        expect(warnings[0]).toContain("droid");
+    });
+
+    it("does not flag --append-system-prompt for droid (droid genuinely accepts it)", () => {
+        const warnings = validateProviderArgs("droid", ["exec", "--append-system-prompt", "be terse"]);
+        expect(warnings).toEqual([]);
     });
 });
 

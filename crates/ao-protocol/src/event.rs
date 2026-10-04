@@ -587,6 +587,14 @@ pub enum SystemMessageSeverity {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RunEndReason {
     Completed,
+    /// The process exited 0 on its own but produced nothing user-visible:
+    /// no text, no tool calls, no form. That is a failure wearing a success
+    /// exit code — observed with a flaky model gateway returning empty
+    /// completions (the CLI retried internally, gave up, exited 0), where
+    /// classifying it `Completed` hid it from every silent-failure guard and
+    /// left channel users with total silence. Tool-only turns are NOT this:
+    /// visible tool activity keeps the reason `Completed`.
+    CompletedEmpty,
     TimedOut,
     NoOutputTimeout,
     Cancelled,

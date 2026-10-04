@@ -165,6 +165,17 @@ pub struct AgentProfile {
     /// Absent in profiles that have not been migrated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_system_prompt: Option<String>,
+    /// When true, the system-prompt composer omits the platform-level
+    /// instruction blocks (baseline tool-routing guidance, CLI tool
+    /// preference, memory-save guidance) and emits only the identity,
+    /// run-context, persona/special-instructions, and context-data sections.
+    /// For agents whose CLI harness already carries its own behavioral
+    /// prompt (e.g. droid) the platform blocks are dead weight — hundreds of
+    /// tokens of orchestration guidance per turn that can even conflict with
+    /// the harness's own style rules. Default (absent/false) keeps the full
+    /// prompt every existing agent gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimal_prompt: Option<bool>,
     /// Per-profile cap on spawn/delegation depth. When absent, the resolver
     /// `effective_depth_cap` falls back to the global `DEFAULT_DEPTH_CAP`
     /// (subagent spawner) or `DELEGATE_DEPTH_CAP` (Delegate tool).
@@ -194,6 +205,7 @@ pub enum ChannelKind {
     Slack,
     WhatsApp,
     Webhook,
+    Matrix,
 }
 
 impl ChannelKind {
@@ -208,6 +220,7 @@ impl ChannelKind {
             ChannelKind::Slack => "slack",
             ChannelKind::WhatsApp => "whatsapp",
             ChannelKind::Webhook => "webhook",
+            ChannelKind::Matrix => "matrix",
         }
     }
 }
@@ -403,6 +416,73 @@ pub enum ChannelKindConfig {
         #[serde(default)]
         conversation_mode: SlackConversationMode,
     },
+    /// A Matrix bot user on a (federated) homeserver. Field docs lean on the
+    /// design docs: `guide/matrix-channel-design.md` (v1 baseline) and the
+    /// v2 feature additions — every v2 field is serde-defaulted so profiles
+    /// written by the v1 slice keep parsing unchanged.
+    Matrix {
+        /// Cached from `whoami` at connect time (mirrors Telegram's
+        /// `bot_username`). `None` until the first successful connection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bot_user_id: Option<String>,
+        /// Homeserver base URL, e.g. `https://matrix-client.matrix.org`.
+        /// Matrix is federated, so unlike Telegram's single API base this is
+        /// per-binding config.
+        homeserver_url: String,
+        /// Accept room invites automatically, but only when the inviting
+        /// sender is linked (blanket autojoin would let strangers pull the
+        /// bot into rooms and break the reject-all posture).
+        #[serde(default = "default_true")]
+        auto_accept_invites: bool,
+        /// In multi-member rooms, require an explicit address (`m.mentions`
+        /// hit, reply to the bot, or command prefix). DMs always pass.
+        /// Mirrors Telegram's group-addressing posture.
+        #[serde(default = "default_true")]
+        require_addressing_in_rooms: bool,
+        /// Command prefix for pairing and any future chat commands.
+        #[serde(default = "default_matrix_command_prefix")]
+        command_prefix: String,
+        /// Whether native Matrix threads (`m.thread` relations) mint their
+        /// own Launchpad threads. v2 feature; the v1 baseline treats every
+        /// room as one conversation regardless.
+        #[serde(default)]
+        thread_mode: MatrixThreadMode,
+        /// Progressive reply streaming via `m.replace` edits. Off in rooms
+        /// by default: edits don't notify, so room users would miss updates.
+        #[serde(default)]
+        stream_edits: MatrixStreamEdits,
+        /// Whether a linked sender editing their own message dispatches a
+        /// correction turn. Default off (v2 F8 opt-in).
+        #[serde(default)]
+        process_edits: bool,
+        /// React to the triggering message: 👀 on dispatch, ✅ on clean
+        /// reply, ⚠️ on a non-`Completed` run end.
+        #[serde(default = "default_true")]
+        ack_reactions: bool,
+        /// Treat 👍/👎 reactions on the bot's own replies as feedback
+        /// signals instead of dropping them.
+        #[serde(default = "default_true")]
+        feedback_reactions: bool,
+        /// Send `m.read` receipts for dispatched messages.
+        #[serde(default = "default_true")]
+        send_read_receipts: bool,
+        /// Download inbound attachments (`m.image`/`m.file`/`m.audio`/
+        /// `m.video`) into the agent's asset dir for the run.
+        #[serde(default = "default_true")]
+        download_attachments: bool,
+        /// Inbound attachment size cap, enforced before download.
+        #[serde(default = "default_matrix_download_max_bytes")]
+        download_max_bytes: u64,
+        /// Bot profile display name set at provisioning. Defaults to the
+        /// agent name when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bot_display_name: Option<String>,
+        /// Cold/warm engagement state machine (ported from Discord's; the
+        /// v1 baseline is mention-only in rooms). `thread_follow` reuses the
+        /// shared [`ThreadFollowMode`] semantics.
+        #[serde(default)]
+        engagement: MatrixEngagementConfig,
+    },
 }
 
 /// How a Slack conversation (a DM, a channel `@mention` thread, or a reply
@@ -437,6 +517,86 @@ fn default_thread_message_budget() -> u32 {
 
 fn default_backfill_limit() -> u32 {
     20
+}
+
+fn default_matrix_command_prefix() -> String {
+    "!agent".to_string()
+}
+
+/// 25 MiB — generous enough for documents and photos, small enough that a
+/// malicious or accidental multi-hundred-MB upload can't fill an agent's
+/// asset dir.
+fn default_matrix_download_max_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+/// Whether a Matrix message carrying an `m.thread` relation resolves/mints a
+/// distinct Launchpad thread (parity with Discord threads and Slack's
+/// `thread_ts`) or folds into the room's single conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixThreadMode {
+    /// Ignore `m.thread` relations; one Launchpad thread per room.
+    Off,
+    /// Join existing threads: a message in a Matrix thread maps to that
+    /// thread's Launchpad conversation; room-timeline messages stay in the
+    /// room's conversation.
+    #[default]
+    Follow,
+    /// Also create Matrix threads: the bot's replies in a room open an
+    /// `m.thread` rooted at the triggering message.
+    Always,
+}
+
+/// Where progressive `m.replace` streaming of the agent's reply is used.
+/// Edits don't trigger notifications on Matrix, so streaming in rooms would
+/// leave users unaware of updates — the final message is always sent as the
+/// definitive event regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixStreamEdits {
+    /// Send only the final message.
+    Off,
+    /// Stream in DM rooms only.
+    #[default]
+    DmsOnly,
+    /// Stream everywhere (rooms included).
+    Everywhere,
+}
+
+/// Cold/warm engagement configuration for Matrix rooms — the port target of
+/// Discord's engagement state machine
+/// (`ao_engine::channels::discord::engagement`). Mirrors the Discord
+/// `ChannelKindConfig` fields one-for-one so both channels share semantics
+/// and defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixEngagementConfig {
+    /// How long a conversation the bot was addressed in keeps responding
+    /// without a fresh address.
+    #[serde(default)]
+    pub thread_follow: ThreadFollowMode,
+    /// `StickyDecay`'s idle-timeout knob, in minutes since the last address.
+    #[serde(default = "default_thread_idle_timeout_minutes")]
+    pub idle_timeout_minutes: u32,
+    /// How many unaddressed messages a warm conversation tolerates before
+    /// cooling off.
+    #[serde(default = "default_thread_message_budget")]
+    pub message_budget: u32,
+    /// Messages of conversation history prefixed onto the first turn after a
+    /// cold→warm transition (`0` disables backfill).
+    #[serde(default = "default_backfill_limit")]
+    pub backfill_limit: u32,
+}
+
+impl Default for MatrixEngagementConfig {
+    fn default() -> Self {
+        Self {
+            thread_follow: ThreadFollowMode::default(),
+            idle_timeout_minutes: default_thread_idle_timeout_minutes(),
+            message_budget: default_thread_message_budget(),
+            backfill_limit: default_backfill_limit(),
+        }
+    }
 }
 
 /// How long a thread the bot was mentioned in keeps responding without a
@@ -590,6 +750,8 @@ struct AgentProfileWire {
     #[serde(default)]
     legacy_system_prompt: Option<String>,
     #[serde(default)]
+    minimal_prompt: Option<bool>,
+    #[serde(default)]
     max_delegation_depth: Option<u32>,
     /// New-shape channel bindings. Present (possibly empty) on any profile
     /// saved after this migration landed.
@@ -645,6 +807,7 @@ impl From<AgentProfileWire> for AgentProfile {
             persona: wire.persona,
             special_instructions: wire.special_instructions,
             legacy_system_prompt: wire.legacy_system_prompt,
+            minimal_prompt: wire.minimal_prompt,
             max_delegation_depth: wire.max_delegation_depth,
             channels,
         }
@@ -948,7 +1111,10 @@ pub const PAIRING_CODE_ALPHABET: &str = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 pub const PAIRING_CODE_LENGTH: usize = 6;
 
 /// How long a generated pairing code remains valid, in seconds.
-pub const PAIRING_CODE_TTL_SECONDS: i64 = 600;
+/// 30 minutes: a human has to read the code, switch apps, and type it —
+/// the original 10-minute window repeatedly expired mid-flow in live use.
+/// Still short-lived, single-use, and grants room-linking only.
+pub const PAIRING_CODE_TTL_SECONDS: i64 = 1800;
 
 /// A short-lived, human-typeable code used to link a Telegram chat to an
 /// agent through the pairing flow. Callers own the wall clock: this type
@@ -961,7 +1127,7 @@ pub struct PairingCode {
 
 impl PairingCode {
     /// Generates a new pairing code expiring `PAIRING_CODE_TTL_SECONDS`
-    /// (10 minutes) after `now_unix`.
+    /// (30 minutes) after `now_unix`.
     pub fn generate(now_unix: i64) -> Self {
         let alphabet = PAIRING_CODE_ALPHABET.as_bytes();
         let random_bytes = uuid::Uuid::new_v4().into_bytes();
@@ -1175,6 +1341,7 @@ mod plugin_enablement_tests {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
             max_turns: None,
@@ -1728,6 +1895,86 @@ telegram:
     }
 
     #[test]
+    fn matrix_config_json_minimal_payload_deserializes_to_documented_defaults() {
+        // A payload carrying only the one field with no default (the
+        // homeserver URL) must deserialize with the v1 fail-closed posture
+        // (addressing required in rooms, invites auto-accepted only from
+        // linked senders) and the v2 feature defaults — no migration, ever.
+        let json = r#"{ "type": "Matrix", "homeserver_url": "https://matrix.example.com" }"#;
+        let config: ChannelKindConfig =
+            serde_json::from_str(json).expect("minimal matrix config should deserialize");
+        assert_eq!(
+            config,
+            ChannelKindConfig::Matrix {
+                bot_user_id: None,
+                homeserver_url: "https://matrix.example.com".to_string(),
+                auto_accept_invites: true,
+                require_addressing_in_rooms: true,
+                command_prefix: "!agent".to_string(),
+                thread_mode: MatrixThreadMode::Follow,
+                stream_edits: MatrixStreamEdits::DmsOnly,
+                process_edits: false,
+                ack_reactions: true,
+                feedback_reactions: true,
+                send_read_receipts: true,
+                download_attachments: true,
+                download_max_bytes: 25 * 1024 * 1024,
+                bot_display_name: None,
+                engagement: MatrixEngagementConfig::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn matrix_config_round_trips_through_json_and_yaml() {
+        let config = ChannelKindConfig::Matrix {
+            bot_user_id: Some("@bot:example.com".to_string()),
+            homeserver_url: "https://matrix.example.com".to_string(),
+            auto_accept_invites: false,
+            require_addressing_in_rooms: false,
+            command_prefix: "!ops".to_string(),
+            thread_mode: MatrixThreadMode::Always,
+            stream_edits: MatrixStreamEdits::Everywhere,
+            process_edits: true,
+            ack_reactions: false,
+            feedback_reactions: false,
+            send_read_receipts: false,
+            download_attachments: false,
+            download_max_bytes: 1024,
+            bot_display_name: Some("Ops Bot".to_string()),
+            engagement: MatrixEngagementConfig {
+                thread_follow: ThreadFollowMode::OneShot,
+                idle_timeout_minutes: 5,
+                message_budget: 3,
+                backfill_limit: 7,
+            },
+        };
+        let json = serde_json::to_string(&config).expect("serialize json");
+        let back: ChannelKindConfig = serde_json::from_str(&json).expect("deserialize json");
+        assert_eq!(config, back);
+        let yaml = serde_yaml::to_string(&config).expect("serialize yaml");
+        assert!(yaml.contains("matrix") || yaml.contains("Matrix"));
+        let back_yaml: ChannelKindConfig = serde_yaml::from_str(&yaml).expect("deserialize yaml");
+        assert_eq!(config, back_yaml);
+    }
+
+    #[test]
+    fn matrix_engagement_config_defaults_match_discord_semantics() {
+        let engagement = MatrixEngagementConfig::default();
+        assert_eq!(engagement.thread_follow, ThreadFollowMode::StickyDecay);
+        assert_eq!(engagement.idle_timeout_minutes, 15);
+        assert_eq!(engagement.message_budget, 10);
+        assert_eq!(engagement.backfill_limit, 20);
+    }
+
+    #[test]
+    fn matrix_kind_as_str_matches_serde_wire_form() {
+        assert_eq!(ChannelKind::Matrix.as_str(), "matrix");
+        let json = serde_json::to_string(&ChannelKind::Matrix).unwrap();
+        assert_eq!(json, "\"matrix\"");
+    }
+
+    #[test]
     fn discord_config_json_missing_engagement_fields_deserializes_to_documented_defaults() {
         // A profile persisted before `require_mention`/`thread_follow`/
         // `thread_idle_timeout_minutes`/`thread_message_budget`/
@@ -1793,7 +2040,7 @@ telegram:
             "every character must come from the pairing code alphabet: {}",
             code.code
         );
-        assert_eq!(code.expires_at_unix, 1_700_000_600);
+        assert_eq!(code.expires_at_unix, 1_700_001_800);
     }
 
     #[test]

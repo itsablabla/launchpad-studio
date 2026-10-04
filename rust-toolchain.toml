@@ -1,0 +1,4 @@
+[toolchain]
+# Floor set by matrix-sdk 0.19 (MSRV 1.96) — see guide/MATRIX_PLAN.md D1.
+# Pinned minor, same exact-pin discipline as workspace dependency pins.
+channel = "1.99"

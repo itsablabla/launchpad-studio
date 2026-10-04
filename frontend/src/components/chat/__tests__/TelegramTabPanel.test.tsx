@@ -129,14 +129,14 @@ describe("TelegramTabPanel", () => {
         const toggle = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "How to connect")!;
         expect(toggle).not.toBeUndefined();
         expect(toggle.getAttribute("aria-expanded")).toBe("false");
-        expect(container.textContent).not.toContain("single-use and expires in 10 minutes");
+        expect(container.textContent).not.toContain("single-use and expires in 30 minutes");
 
         await act(async () => {
             toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
         });
 
         expect(toggle.getAttribute("aria-expanded")).toBe("true");
-        expect(container.textContent).toContain("single-use and expires in 10 minutes");
+        expect(container.textContent).toContain("single-use and expires in 30 minutes");
         expect(container.textContent).toContain("Group Privacy");
     });
 

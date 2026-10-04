@@ -27,6 +27,7 @@ pub mod search;
 pub mod skills;
 pub mod stream;
 pub mod system;
+pub mod matrix;
 pub mod telegram;
 pub mod threads;
 pub mod webhooks;
@@ -238,6 +239,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/agents/{agent_id}/telegram/chats/{chat_id}",
             axum::routing::delete(telegram::delete_telegram_chat),
+        )
+        .route(
+            "/agents/{agent_id}/matrix/connection",
+            axum::routing::put(matrix::set_matrix_connection)
+                .delete(matrix::delete_matrix_connection),
+        )
+        .route(
+            "/agents/{agent_id}/matrix/status",
+            axum::routing::get(matrix::get_matrix_status),
+        )
+        .route(
+            "/agents/{agent_id}/matrix/pairing-code",
+            axum::routing::post(matrix::create_matrix_pairing_code),
+        )
+        .route(
+            "/agents/{agent_id}/matrix/rooms/{room_id}",
+            axum::routing::delete(matrix::delete_matrix_room),
         )
         .route(
             "/agents/{agent_id}/channels",

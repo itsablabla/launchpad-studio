@@ -316,6 +316,14 @@ export interface CliTemplate {
     label: string;
     command: string;
     versionFlag: string;
+    /**
+     * Oldest version the integration is verified against, inclusive. When
+     * set, detection runs the version probe and a found-but-older binary
+     * reports `stale` instead of `ok` — a stale binary earlier on PATH
+     * silently shadows a current one and fails every run (observed with a
+     * Homebrew droid 0.129.0 shadowing 0.232.0).
+     */
+    minVersion?: string;
 }
 
 export const CLI_TEMPLATES: CliTemplate[] = [
@@ -323,32 +331,76 @@ export const CLI_TEMPLATES: CliTemplate[] = [
     { id: "cursor", label: "Cursor", command: "cursor-agent", versionFlag: "-v" },
     { id: "codex", label: "Codex", command: "codex", versionFlag: "-V" },
     { id: "agy", label: "Antigravity", command: "agy", versionFlag: "--version" },
+    // Pre-0.2xx droid fails every Launchpad-driven exec run (verified:
+    // 0.129.0 emits a stream error and exits 1 immediately after init).
+    { id: "droid", label: "Droid", command: "droid", versionFlag: "--version", minVersion: "0.200.0" },
 ];
 
+export type CliDetection =
+    | { status: "probing" }
+    | { status: "ok"; version: string | null }
+    | { status: "stale"; version: string }
+    | { status: "missing" };
+
+/** Numeric-tuple compare: "0.200.0" vs "0.129.0" → true. Unparseable input is never stale. */
+export function isVersionAtLeast(found: string, minimum: string): boolean {
+    const parse = (v: string) =>
+        v.split(".").map((part) => {
+            const n = parseInt(part, 10);
+            return Number.isFinite(n) ? n : 0;
+        });
+    const f = parse(found);
+    const m = parse(minimum);
+    if (f.length === 0 || m.length === 0) return true;
+    for (let i = 0; i < m.length; i++) {
+        const diff = (f[i] ?? 0) - m[i];
+        if (diff !== 0) return diff > 0;
+    }
+    return true;
+}
+
 /**
- * Probe whether each configured CLI binary is on PATH. Returns a map of
- * template-id → `true | false | null` where `null` means "still probing".
- * Used by the template chip strip to show availability dots.
+ * Probe whether each configured CLI binary is on PATH. Templates with a
+ * `minVersion` get the version-aware probe; the rest keep the cheap
+ * yes/no check. Used by the template chip strip to show availability dots.
  */
 export function useCliDetection() {
-    const [availability, setAvailability] = useState<Record<string, boolean | null>>(() =>
-        Object.fromEntries(CLI_TEMPLATES.map((t) => [t.id, null]))
+    const [availability, setAvailability] = useState<Record<string, CliDetection>>(() =>
+        Object.fromEntries(CLI_TEMPLATES.map((t) => [t.id, { status: "probing" as const }]))
     );
 
     useEffect(() => {
         let cancelled = false;
         const id = setTimeout(() => {
             for (const tpl of CLI_TEMPLATES) {
-                invoke<boolean>("check_cli_available", {
-                    command: tpl.command,
-                    versionFlag: tpl.versionFlag,
-                })
-                    .then((available) => {
-                        if (!cancelled) setAvailability((prev) => ({ ...prev, [tpl.id]: available }));
+                const report = (det: CliDetection) => {
+                    if (!cancelled) setAvailability((prev) => ({ ...prev, [tpl.id]: det }));
+                };
+                if (tpl.minVersion) {
+                    invoke<unknown>("probe_cli_version", {
+                        command: tpl.command,
+                        versionFlag: tpl.versionFlag,
                     })
-                    .catch(() => {
-                        if (!cancelled) setAvailability((prev) => ({ ...prev, [tpl.id]: false }));
-                    });
+                        .then((version) => {
+                            if (typeof version !== "string" || version.length === 0) {
+                                report({ status: "missing" });
+                            } else if (isVersionAtLeast(version, tpl.minVersion!)) {
+                                report({ status: "ok", version });
+                            } else {
+                                report({ status: "stale", version });
+                            }
+                        })
+                        .catch(() => report({ status: "missing" }));
+                } else {
+                    invoke<boolean>("check_cli_available", {
+                        command: tpl.command,
+                        versionFlag: tpl.versionFlag,
+                    })
+                        .then((available) =>
+                            report(available ? { status: "ok", version: null } : { status: "missing" })
+                        )
+                        .catch(() => report({ status: "missing" }));
+                }
             }
         }, 0);
         return () => { cancelled = true; clearTimeout(id); };

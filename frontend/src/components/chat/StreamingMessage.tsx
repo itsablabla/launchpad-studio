@@ -6,6 +6,7 @@ import { ArrowUp, ArrowDown, Zap, Sparkles, Lightbulb, LightbulbOff, ChevronDown
 import {
   useStreamingText,
   useActiveToolCalls,
+  useCompletedToolCalls,
   useTurnUsage,
   useInFlightThinking,
   useInFlightArtifactIds,
@@ -18,10 +19,11 @@ import {
 } from "../../stores/chatStore";
 import { useIsDark, useUserPreferencesStore } from "../../stores/userPreferencesStore";
 import { agentAvatarColor } from "../../lib/agentColors";
-import { ArtifactCardTile, SkillLoadChip, type CoalescedSegment } from "./MessageBubble";
+import { ArtifactCardTile, SkillLoadChip, stripThinkingTags, type CoalescedSegment } from "./MessageBubble";
 
-import { stripMcpPrefix, describeToolCall } from "./toolCallLabel";
+import { stripMcpPrefix, describeToolCall, isToolRowSkipped } from "./toolCallLabel";
 export { stripMcpPrefix, describeToolCall } from "./toolCallLabel";
+import { ToolCallGroup, type ToolCallRecord } from "./ToolCallGroup";
 
 /** Format elapsed seconds into a human-readable string */
 function formatElapsed(seconds: number): string {
@@ -512,6 +514,7 @@ export function StreamingMessage({ prefixSegments }: { prefixSegments?: Coalesce
   const streamingThreadId = useStreamingThreadId(selectedAgentId);
   const streamingText = useStreamingText(selectedAgentId, streamingThreadId);
   const activeToolCalls = useActiveToolCalls(selectedAgentId, streamingThreadId);
+  const completedToolCalls = useCompletedToolCalls(selectedAgentId, streamingThreadId);
   const turnUsage = useTurnUsage(selectedAgentId, streamingThreadId);
   const thinking = useInFlightThinking(selectedAgentId, streamingThreadId);
   const artifactIds = useInFlightArtifactIds(selectedAgentId, streamingThreadId);
@@ -524,7 +527,7 @@ export function StreamingMessage({ prefixSegments }: { prefixSegments?: Coalesce
 
   const hasPrefix = (prefixSegments?.length ?? 0) > 0;
   const hasContent =
-    !!streamingText || activeToolCalls.length > 0 || hasPrefix || !!thinking || artifactIds.length > 0;
+    !!streamingText || activeToolCalls.length > 0 || completedToolCalls.length > 0 || hasPrefix || !!thinking || artifactIds.length > 0;
 
   // Sticky "has this turn shown anything yet" latch. A thinking block that
   // runs with `display = "omitted"` flips `thinking` from a live object
@@ -565,12 +568,27 @@ export function StreamingMessage({ prefixSegments }: { prefixSegments?: Coalesce
   // Normalize the tool name through `stripMcpPrefix` for the Agent branch so an
   // MCP-routed Agent call (`mcp__launchpad__Agent`) still picks up the
   // elapsed-time + rotating-status indicator variant rather than the generic chip.
-  const indicators = activeToolCalls.map((tc) => ({
-    ...(tc.label != null ? { label: tc.label } : describeToolCall(tc.tool, tc.input)),
-    isAgent: stripMcpPrefix(tc.tool) === "Agent",
-    startedAt: tc.startedAt,
-    done: tc.done,
-  }));
+  //
+  // Classic chips (no `action_id`) render as ToolCallGroup rows instead —
+  // merged after the completed ones so the running call sits at the bottom,
+  // auto-expanded while it's in focus, exactly like the droid TUI. Skip-listed
+  // tools (forms, ArtifactWrite) render through their own richer components,
+  // same exclusion the history pairing applies. Running rows carry the
+  // provider's tool_use_id so the row's React key survives the
+  // running → completed transition without a remount.
+  const runningClassic = activeToolCalls.filter((tc) => tc.action_id == null && !isToolRowSkipped(tc.tool));
+  const liveToolCalls: ToolCallRecord[] = [
+    ...completedToolCalls.filter((c) => !isToolRowSkipped(c.tool)),
+    ...runningClassic.map((tc) => ({ id: tc.tool_use_id, tool: tc.tool, input: tc.input, running: true as const })),
+  ];
+  const indicators = activeToolCalls
+    .filter((tc) => tc.action_id != null)
+    .map((tc) => ({
+      ...(tc.label != null ? { label: tc.label } : describeToolCall(tc.tool, tc.input)),
+      isAgent: stripMcpPrefix(tc.tool) === "Agent",
+      startedAt: tc.startedAt,
+      done: tc.done,
+    }));
 
   return (
     <div className="flex items-start gap-[10px]">
@@ -627,7 +645,7 @@ export function StreamingMessage({ prefixSegments }: { prefixSegments?: Coalesce
             )
           )}
           {streamingText && (
-            <Markdown remarkPlugins={[remarkGfm]} components={streamingMdComponents}>{streamingText}</Markdown>
+            <Markdown remarkPlugins={[remarkGfm]} components={streamingMdComponents}>{stripThinkingTags(streamingText)}</Markdown>
           )}
           {/* Thinking pill sits below the message text, above the token-count
               strip. Renders for any of: live "Thinking…" (no buffered text),
@@ -637,6 +655,11 @@ export function StreamingMessage({ prefixSegments }: { prefixSegments?: Coalesce
           {/* Token-count strip — visible whenever a `usage` event has arrived
               for the current turn. Sits above the chips. */}
           {turnUsage && <UsageStrip usage={turnUsage} accentColor={bubbleColor} />}
+          {/* The turn's tool transcript — droid-TUI style: finished calls are
+              collapsed rows, the call currently in focus (running) is a row
+              at the bottom auto-expanded with its input visible, collapsing
+              itself the moment it completes. */}
+          {liveToolCalls.length > 0 && <ToolCallGroup calls={liveToolCalls} live />}
           {/* Cursor — plain blink when idle, L-shape(s) into tool label(s) when
               active. Caps to the most recent 3 indicators, with a "+N more"
               label above when there are more — keeps the bubble from growing
@@ -656,7 +679,7 @@ export function StreamingMessage({ prefixSegments }: { prefixSegments?: Coalesce
                 )
               )}
             </>
-          ) : (
+          ) : runningClassic.length > 0 || completedToolCalls.length > 0 ? null : (
             <span className="inline-flex items-center gap-[3px] mt-[6px] align-middle">
               {[0, 1, 2].map((i) => (
                 <motion.span

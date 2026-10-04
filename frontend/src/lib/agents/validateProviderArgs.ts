@@ -12,13 +12,14 @@
  * can still add novel flags without fighting false positives.
  */
 
-export type KnownProviderCommand = "claude" | "cursor-agent" | "codex" | "agy";
+export type KnownProviderCommand = "claude" | "cursor-agent" | "codex" | "agy" | "droid";
 
 const KNOWN_PROVIDER_COMMANDS: readonly KnownProviderCommand[] = [
     "claude",
     "cursor-agent",
     "codex",
     "agy",
+    "droid",
 ];
 
 /** Flags every one of our shipped templates may use interchangeably — never a signal of cross-contamination. */
@@ -41,7 +42,8 @@ const SIGNATURE_FLAGS: Record<string, SignatureFlag> = {
     // auto-approve flag), so it's not Claude-exclusive.
     "--dangerously-skip-permissions": { validFor: ["claude", "agy"], ownerLabel: "Claude and agy" },
     "--include-partial-messages": { validFor: ["claude"], ownerLabel: "Claude" },
-    "--append-system-prompt": { validFor: ["claude"], ownerLabel: "Claude" },
+    // droid exec takes --append-system-prompt too (append-only, like Claude).
+    "--append-system-prompt": { validFor: ["claude", "droid"], ownerLabel: "Claude and droid" },
     "--thinking": { validFor: ["claude"], ownerLabel: "Claude" },
     "--thinking-display": { validFor: ["claude"], ownerLabel: "Claude" },
     "--max-thinking-tokens": { validFor: ["claude"], ownerLabel: "Claude" },
@@ -69,11 +71,34 @@ const SIGNATURE_FLAGS: Record<string, SignatureFlag> = {
     "--new-project": { validFor: ["agy"], ownerLabel: "agy" },
     "--project": { validFor: ["agy"], ownerLabel: "agy" },
     "--print-timeout": { validFor: ["agy"], ownerLabel: "agy" },
+    // droid exec (Factory CLI). droid exits 2 on any unrecognized flag.
+    "--auto": { validFor: ["droid"], ownerLabel: "droid" },
+    "--skip-permissions-unsafe": { validFor: ["droid"], ownerLabel: "droid" },
+    "--settings": { validFor: ["droid"], ownerLabel: "droid" },
+    "--use-spec": { validFor: ["droid"], ownerLabel: "droid" },
+    "--spec-model": { validFor: ["droid"], ownerLabel: "droid" },
+    "--spec-reasoning-effort": { validFor: ["droid"], ownerLabel: "droid" },
+    "--reasoning-effort": { validFor: ["droid"], ownerLabel: "droid" },
+    "-r": { validFor: ["droid"], ownerLabel: "droid" },
+    "--session-id": { validFor: ["droid"], ownerLabel: "droid" },
+    "-s": { validFor: ["droid"], ownerLabel: "droid" },
+    "--fork": { validFor: ["droid"], ownerLabel: "droid" },
+    "--worktree": { validFor: ["droid"], ownerLabel: "droid" },
+    "--mission": { validFor: ["droid"], ownerLabel: "droid" },
+    "--worker-model": { validFor: ["droid"], ownerLabel: "droid" },
+    "--validator-model": { validFor: ["droid"], ownerLabel: "droid" },
+    "--only-tools": { validFor: ["droid"], ownerLabel: "droid" },
+    "--add-tools": { validFor: ["droid"], ownerLabel: "droid" },
+    "--remove-tools": { validFor: ["droid"], ownerLabel: "droid" },
+    "--disable-builtin-skills": { validFor: ["droid"], ownerLabel: "droid" },
+    "--append-system-prompt-file": { validFor: ["droid"], ownerLabel: "droid" },
+    "--list-tools": { validFor: ["droid"], ownerLabel: "droid" },
 };
 
 const KNOWN_FAILURE_MODE: Partial<Record<KnownProviderCommand, string>> = {
     codex: 'codex will hard-error with "unexpected argument" and the run will fail',
     "cursor-agent": "cursor-agent will silently exit 1 with no output",
+    droid: "droid exits 2 (invalid CLI arguments) on unrecognized flags and the run will fail",
 };
 
 function commandBasename(command: string): string {

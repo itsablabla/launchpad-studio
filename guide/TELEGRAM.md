@@ -41,7 +41,7 @@ anti-spam gate, not a bug.
 > [!IMPORTANT]
 > **Every chat needs its own pairing code.** Each DM and each group is paired
 > **separately**, using a **freshly generated code each time** — codes are
-> **single-use** and **expire after 10 minutes**. Pairing a new chat only *adds*
+> **single-use** and **expire after 30 minutes**. Pairing a new chat only *adds*
 > to the agent's linked-chats list; it never overwrites or removes chats you
 > already paired. Link a DM today and a group next week — both keep working.
 

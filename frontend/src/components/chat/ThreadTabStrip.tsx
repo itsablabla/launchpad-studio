@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import {
   AtSign,
+  Brackets,
   ClipboardList,
   GitBranch,
   Hash,
@@ -123,6 +124,7 @@ export const CHANNEL_KIND_ICON: Record<ChannelOriginKind, React.ComponentType<{ 
   slack: Slack,
   whatsapp: MessageCircle,
   webhook: Webhook,
+  matrix: Brackets,
 };
 
 interface ThreadTabStripProps {

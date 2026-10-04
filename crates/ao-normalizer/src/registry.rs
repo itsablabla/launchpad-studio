@@ -6,6 +6,7 @@ use crate::agy::AgyNormalizer;
 use crate::claude::ClaudeNormalizer;
 use crate::codex::CodexNormalizer;
 use crate::cursor_agent::CursorAgentNormalizer;
+use crate::droid::DroidNormalizer;
 use crate::generic::GenericNormalizer;
 use crate::traits::OutputNormalizer;
 
@@ -53,6 +54,14 @@ impl NormalizerRegistry {
             "agy",
             Box::new(|config: &CliProviderConfig| -> Box<dyn OutputNormalizer> {
                 Box::new(AgyNormalizer::new(config))
+            }),
+        );
+
+        // Register Factory Droid (`droid exec`) normalizer
+        registry.register(
+            "droid",
+            Box::new(|config: &CliProviderConfig| -> Box<dyn OutputNormalizer> {
+                Box::new(DroidNormalizer::new(config))
             }),
         );
 

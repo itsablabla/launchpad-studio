@@ -35,7 +35,7 @@ pub use memory::MemoryOpResult;
 use std::sync::Arc;
 
 use ao_protocol::agent::ChannelKind;
-use ao_protocol::assignment::AssignmentThreadPolicy;
+use ao_protocol::assignment::{AssignmentRunStatus, AssignmentThreadPolicy};
 use ao_protocol::error::AoError;
 use ao_protocol::thread::{default_thread_id, AssignmentBridgeOrigin, ChannelBridgeOrigin};
 
@@ -255,6 +255,12 @@ impl PersistenceLayer {
             }
         }
 
+        // Startup sweep: assignment runs stuck in Queued/Running belong to a
+        // process that no longer exists (the queue and instance registry are
+        // in-memory), so without this they'd render as live in the
+        // Assignments UI forever.
+        fail_stale_assignment_runs(&assignments, &assignment_runs, &data_root).await;
+
         Ok(Self {
             agents: agents_store,
             projects: ProjectStore::new(data_root.clone()),
@@ -284,6 +290,115 @@ impl PersistenceLayer {
             data_root,
         })
     }
+}
+
+/// Flip every persisted assignment run stuck in `Queued`/`Running` to
+/// `Failed` at startup. Those statuses are owned by the live process — the
+/// personal queue and the instance registry are in-memory, so nothing in a
+/// fresh process will ever write the terminal transition for a row the
+/// previous process was executing when it died. Without this sweep the
+/// Assignments UI shows such runs as running forever (observed after a
+/// dev-watcher restart killed an in-flight assignment run).
+///
+/// Rows are not re-queued: a cron/schedule trigger fires again on its own,
+/// and blindly re-dispatching would risk re-running tool side effects.
+/// Best-effort like the backfills above: per-assignment failures are logged,
+/// never fatal to startup.
+async fn fail_stale_assignment_runs(
+    assignments: &AssignmentStore,
+    assignment_runs: &AssignmentRunStore,
+    data_root: &DataRoot,
+) {
+    // Single-owner guard. This sweep's premise — "every non-terminal row
+    // belongs to a dead process" — is false when a SECOND server is running
+    // against this same data root: its live runs sit in exactly those
+    // statuses. The workspace lock is the only cross-process witness; when
+    // it names a live pid that isn't ours, the rows are that process's
+    // business and we must not touch them. (Residual race: two processes
+    // booting simultaneously can both pass this check before either writes
+    // its lock — accepted; the lock itself is best-effort by design.)
+    if let Some(pid) = foreign_live_lock_pid(data_root).await {
+        tracing::warn!(
+            lock_holder_pid = pid,
+            "skipping stale assignment-run sweep: data root is locked by another live process"
+        );
+        return;
+    }
+    for assignment in assignments.list_all().await {
+        let Ok(runs) = assignment_runs.list_for_assignment(&assignment.id).await else {
+            continue;
+        };
+        for run in runs {
+            if !matches!(
+                run.status,
+                AssignmentRunStatus::Queued | AssignmentRunStatus::Running
+            ) {
+                continue;
+            }
+            let mut stale = run;
+            stale.status = AssignmentRunStatus::Failed;
+            stale.error = Some(
+                "The server restarted while this run was in flight and it was not recovered."
+                    .to_string(),
+            );
+            stale.finished_ts = Some(chrono::Utc::now());
+            if let Err(e) = assignment_runs.update(&assignment.id, &stale).await {
+                tracing::warn!(
+                    assignment_id = %assignment.id,
+                    run_id = %stale.id,
+                    error = %e,
+                    "failed to mark stale assignment run as failed at startup"
+                );
+                continue;
+            }
+            tracing::info!(
+                assignment_id = %assignment.id,
+                run_id = %stale.id,
+                "marked stale assignment run as failed at startup"
+            );
+        }
+    }
+}
+
+/// The workspace-lock pid iff it names a LIVE process other than this one.
+/// `None` covers no lock file, unreadable/corrupt JSON (disposable
+/// metadata, same convention as ao-server's lock reader), a lock naming
+/// this process, and a stale lock whose pid is dead. The lock struct itself
+/// is ao-server's; parsed loosely here as a value so the two crates stay
+/// decoupled — the contract is the single `pid` field.
+async fn foreign_live_lock_pid(data_root: &DataRoot) -> Option<u32> {
+    let contents = tokio::fs::read_to_string(data_root.workspace_lock_path())
+        .await
+        .ok()?;
+    let pid = serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()?
+        .get("pid")?
+        .as_u64()? as u32;
+    if pid == std::process::id() {
+        return None;
+    }
+    if pid_is_alive(pid) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+/// Signal-0 liveness probe, matching `ao_process::kill_tree::is_process_alive`'s
+/// unix-only convention: EPERM means the pid exists but belongs to another
+/// user — still alive for our purposes. Non-unix platforms report every pid
+/// as dead rather than guess (a wrong "alive" would silently disable the
+/// sweep forever; a wrong "dead" just runs a redundant sweep).
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 performs error checking only — no signal is sent.
+    let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+    alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(test)]

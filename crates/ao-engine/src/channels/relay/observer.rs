@@ -225,6 +225,10 @@ pub(crate) async fn handle_relay_event<V>(
 /// [`RunEndReason::Completed`], and for which no `TextComplete` was ever
 /// buffered. Returns `None` for `Completed` (no buffered text there is just
 /// an ordinary no-op, not a failure worth reporting).
+/// [`RunEndReason::CompletedEmpty`] DOES get a notice: it means the CLI
+/// exited 0 without producing anything — a real failure mode (flaky gateway
+/// returning empty completions) that would otherwise leave channel users
+/// with total silence, since no reply text was buffered to relay.
 ///
 /// Deliberately never includes the underlying Rust error, a backtrace, a
 /// provider response body, or any file path — none of those are safe to
@@ -235,6 +239,7 @@ pub(crate) async fn handle_relay_event<V>(
 fn terminal_failure_notice(reason: RunEndReason) -> Option<&'static str> {
     match reason {
         RunEndReason::Completed => None,
+        RunEndReason::CompletedEmpty => Some(RUN_EMPTY_REPLY_NOTICE),
         RunEndReason::Cancelled => Some(RUN_CANCELLED_NOTICE),
         RunEndReason::TimedOut | RunEndReason::NoOutputTimeout => Some(RUN_TIMED_OUT_NOTICE),
         RunEndReason::TurnLimitReached => Some(RUN_TURN_LIMIT_NOTICE),
@@ -261,6 +266,12 @@ pub(crate) const RUN_TURN_LIMIT_NOTICE: &str =
 /// Relayed when a run ends in [`RunEndReason::Cancelled`] before producing
 /// any reply.
 pub(crate) const RUN_CANCELLED_NOTICE: &str = "This run was stopped before the agent could finish a reply.";
+
+/// Relayed when a run ends in [`RunEndReason::CompletedEmpty`] — the CLI
+/// exited 0 without producing anything, almost always a transient provider
+/// problem rather than something the user did.
+pub(crate) const RUN_EMPTY_REPLY_NOTICE: &str =
+    "The agent's model returned an empty reply — this is usually a transient provider issue. Please try again.";
 
 /// Text relayed in place of the real reply when this process's outbound
 /// relay lagged badly enough on the shared event bus that
@@ -870,6 +881,42 @@ mod tests {
                 "{reason:?} must relay the shared timeout notice"
             );
         }
+    }
+
+    /// `CompletedEmpty` — exit 0 with nothing produced (e.g. a flaky gateway
+    /// returning empty completions) — must relay its own notice: channel
+    /// users otherwise get total silence for a real failure, since there is
+    /// no buffered reply to send.
+    #[tokio::test]
+    async fn run_ended_completed_empty_with_no_buffered_text_relays_an_empty_reply_notice() {
+        let in_flight: CorrelationMap<i64> = CorrelationMap::new();
+        let lease_gate = LeaseGate::new();
+        in_flight.record("bridge-thread-empty", 556);
+        lease_gate.mark_active("test-binding", "bridge-thread-empty");
+        let sink = RecordingSink::default();
+        let mut pending_text = HashMap::new();
+        let mut last_relayed = HashMap::new();
+
+        handle_relay_event(
+            &lease_gate,
+            &in_flight,
+            &sink,
+            make_event(
+                "agent-empty",
+                "bridge-thread-empty",
+                AgentEventPayload::RunEnded { reason: RunEndReason::CompletedEmpty },
+            ),
+            &mut pending_text,
+            &mut last_relayed,
+        )
+        .await;
+
+        assert_eq!(
+            sink.calls(),
+            vec![("agent-empty".to_string(), 556, RUN_EMPTY_REPLY_NOTICE.to_string())]
+        );
+        // Its own words: not a crash notice, not silence.
+        assert_ne!(RUN_EMPTY_REPLY_NOTICE, RUN_FAILED_NOTICE);
     }
 
     /// `Signal` (the process was killed/interrupted) shares `Error`'s

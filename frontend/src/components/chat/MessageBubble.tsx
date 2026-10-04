@@ -24,6 +24,8 @@ import { truncateFilename } from "./AttachmentPill";
 import { FileIcon } from "./FileIcon";
 import { useIsDark, useUserPreferencesStore } from "../../stores/userPreferencesStore";
 import { escapeRawHtmlOutsideCode } from "../../lib/escapeRawHtml";
+import { ToolCallGroup } from "./ToolCallGroup";
+import type { ToolCallRecord } from "./toolCallLabel";
 
 const LazyMermaidBlock = lazy(() =>
   import("./MermaidBlock").then((mod) => ({ default: mod.MermaidBlock }))
@@ -68,6 +70,21 @@ const AGENT_ACTION_LOOSE_RE = new RegExp(`</?(?:${AGENT_ACTION_TAG_NAMES})(?:\\s
  *  worth rendering. */
 export function stripAgentActionTags(text: string): string {
   return text.replace(AGENT_ACTION_PAIRED_RE, "").replace(AGENT_ACTION_LOOSE_RE, "");
+}
+
+// Custom-model gateways (generic-chat-completion-api) can embed reasoning as
+// `<thinking>…</thinking>` directly in the reply text instead of droid's
+// structured reasoning events. The droid normalizer routes those blocks to
+// the thinking channel for NEW turns, but entries persisted before that fix
+// (and any provider that bypasses the normalizer) still carry the raw tags —
+// strip them at render time so old bubbles display clean too.
+const THINKING_PAIRED_RE = /<(?:thinking|think)>[\s\S]*?<\/(?:thinking|think)>/g;
+const THINKING_LOOSE_RE = /<\/?(?:thinking|think)>/g;
+
+/** Remove inline `<thinking>` blocks and orphan thinking tags from display
+ *  text. Display-layer only — persisted content is never rewritten. */
+export function stripThinkingTags(text: string): string {
+  return text.replace(THINKING_PAIRED_RE, "").replace(THINKING_LOOSE_RE, "");
 }
 
 type MentionSegment =
@@ -590,6 +607,11 @@ interface MessageBubbleProps {
    *  tool_result scan — see `extractArtifactWriteResults`). Renders one
    *  `ArtifactCardTile` per id, above the reply text. */
   artifactIds?: string[];
+  /** The turn's tool-call transcript, resolved by `MessageList` (live-
+   *  finalized `metadata.tool_calls` stamp and/or the persisted
+   *  tool_use/tool_result pairing — see `extractToolCallsByTurn`). Renders
+   *  as droid-TUI-style collapsed rows below the reply text. */
+  toolCalls?: ToolCallRecord[];
 }
 
 /** Format a timestamp string to HH:MM. */
@@ -632,7 +654,7 @@ function isToday(ts: string): boolean {
   return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
 }
 
-export const MessageBubble = memo(function MessageBubble({ entry, agentName, agentEmoji, agentId, attachmentFetcher, groupWithPrevious = false, coalescedSegments, allowBranch = false, artifactIds }: MessageBubbleProps) {
+export const MessageBubble = memo(function MessageBubble({ entry, agentName, agentEmoji, agentId, attachmentFetcher, groupWithPrevious = false, coalescedSegments, allowBranch = false, artifactIds, toolCalls }: MessageBubbleProps) {
   const userMsg = isUserMessage(entry);
   const time = formatTime(entry.ts);
   const status = useMessageStatus(entry);
@@ -681,8 +703,11 @@ export const MessageBubble = memo(function MessageBubble({ entry, agentName, age
     if (coalescedSegments && coalescedSegments.length > 0) return true;
     if (allAttachments.length > 0) return true;
     if (artifactIds && artifactIds.length > 0) return true;
-    return stripAgentActionTags(entry.content ?? "").trim().length > 0;
-  }, [entry.content, allAttachments, artifactIds, coalescedSegments]);
+    // A tool-only turn (rows but no reply text — e.g. an error before the
+    // first token) still has content worth showing.
+    if (toolCalls && toolCalls.length > 0) return true;
+    return stripThinkingTags(stripAgentActionTags(entry.content ?? "")).trim().length > 0;
+  }, [entry.content, allAttachments, artifactIds, coalescedSegments, toolCalls]);
 
   const imageAttachments = useMemo(() => {
     if (!userMsg) return [];
@@ -878,7 +903,7 @@ export const MessageBubble = memo(function MessageBubble({ entry, agentName, age
               {coalescedSegments && coalescedSegments.length > 0 ? (
                 coalescedSegments.map((seg, i) =>
                   seg.kind === "text" ? (
-                    <ContentWithMentions key={`seg-${i}`} content={seg.content} useMarkdown={true} />
+                    <ContentWithMentions key={`seg-${i}`} content={stripThinkingTags(seg.content)} useMarkdown={true} />
                   ) : (
                     <div key={`seg-${i}`}>
                       <SkillLoadChip skillName={seg.skillName} success={seg.success} />
@@ -886,7 +911,7 @@ export const MessageBubble = memo(function MessageBubble({ entry, agentName, age
                   )
                 )
               ) : (
-                <ContentWithMentions content={entry.content} useMarkdown={true} />
+                <ContentWithMentions content={stripThinkingTags(entry.content)} useMarkdown={true} />
               )}
             </div>
             {shouldTruncate && (
@@ -896,6 +921,9 @@ export const MessageBubble = memo(function MessageBubble({ entry, agentName, age
               />
             )}
           </div>
+          {/* Tool-call transcript rows (collapsed, expandable) sit below the
+              reply text, mirroring the droid TUI's per-call affordance. */}
+          {toolCalls && toolCalls.length > 0 && <ToolCallGroup calls={toolCalls} />}
           {shouldTruncate && (
             <button
               type="button"

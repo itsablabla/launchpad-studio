@@ -19,8 +19,8 @@ use ao_engine::telegram::ChannelBridge;
 use ao_engine::AppState;
 use ao_engine_tools_provider_config::{
     ChannelSecretStore, ChannelSecretStoreError, TelegramTokenStore, TelegramTokenStoreError,
-    DISCORD_TOKEN_SECRET_ROLE, EMAIL_PASSWORD_SECRET_ROLE, SLACK_APP_TOKEN_SECRET_ROLE,
-    SLACK_BOT_TOKEN_SECRET_ROLE,
+    DISCORD_TOKEN_SECRET_ROLE, EMAIL_PASSWORD_SECRET_ROLE, MATRIX_TOKEN_SECRET_ROLE,
+    SLACK_APP_TOKEN_SECRET_ROLE, SLACK_BOT_TOKEN_SECRET_ROLE,
 };
 use ao_persistence::linked_sender_store::LinkedSenderStore;
 use ao_protocol::agent::{
@@ -236,6 +236,16 @@ fn secret_stored_for(agent_id: &str, binding: &ChannelBinding) -> Result<bool, A
                 .map_err(map_secret_store_err)?
                 .is_some();
             Ok(bot_token_stored && app_token_stored)
+        }
+        // Matrix's access token is the one secret the UI needs to know
+        // about; the device id and store passphrase ride along in the vault
+        // and are never surfaced here.
+        ChannelKind::Matrix => {
+            let store = ChannelSecretStore::open().map_err(map_secret_store_err)?;
+            Ok(store
+                .get(agent_id, &binding.binding_id, MATRIX_TOKEN_SECRET_ROLE)
+                .map_err(map_secret_store_err)?
+                .is_some())
         }
         // No secret-backed transport exists yet for these kinds.
         ChannelKind::WhatsApp | ChannelKind::Webhook => Ok(false),
@@ -1108,6 +1118,7 @@ mod channel_senders_route_tests {
             persona: None,
             special_instructions: None,
             legacy_system_prompt: None,
+            minimal_prompt: None,
             max_delegation_depth: None,
             channels: vec![],
             max_turns: None,

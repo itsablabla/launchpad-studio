@@ -428,6 +428,456 @@ fn merge_agy_mcp_config_at(home_dir: &std::path::Path, mcp_url: &str) -> std::io
 
 
 
+/// Merge the launchpad MCP server entry into `<cwd>/.factory/mcp.json`.
+///
+/// Verified against `droid 0.232.0` (Factory CLI): `droid exec` has no
+/// `--mcp-config` flag (unrecognized flags exit 2), and its `--settings
+/// <path>` runtime-settings file does NOT honor an `mcpServers` key —
+/// empirically, a settings-carried server is never discovered or connected.
+/// What DOES work is the project-level config file: droid reads
+/// `.factory/mcp.json` from its working directory at startup and connects
+/// every server listed there (confirmed via droid's own MCP logs against a
+/// probe server). So, like cursor-agent, delivery is a real file inside the
+/// user's project, shared across concurrent droid spawns in the same cwd and
+/// left pointing at the most recent session's URL after a run ends.
+///
+/// The entry sets `"oauth": false` so droid never kicks off an OAuth
+/// discovery dance against launchpad's unauthenticated localhost endpoint.
+///
+/// Reads and merges rather than overwriting outright, so a project's own
+/// `.factory/mcp.json` (real Factory MCP servers) survives.
+fn merge_droid_mcp_config(cwd: &std::path::Path, mcp_url: &str) -> std::io::Result<()> {
+    let factory_dir = cwd.join(".factory");
+    std::fs::create_dir_all(&factory_dir)?;
+    let config_path = factory_dir.join("mcp.json");
+
+    let mut root: serde_json::Value = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let servers = root
+        .as_object_mut()
+        .expect("root is always an object: constructed or filtered above")
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        *servers = serde_json::json!({});
+    }
+    servers
+        .as_object_mut()
+        .expect("just normalized to an object above")
+        .insert(
+            "launchpad".to_string(),
+            serde_json::json!({ "type": "http", "url": mcp_url, "oauth": false }),
+        );
+
+    let json_str = serde_json::to_string_pretty(&root)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // Atomic write (temp + rename): concurrent droid runs in the same cwd
+    // share this file, and a plain truncate-then-write lets a droid starting
+    // mid-write read a torn/empty config and run silently tool-less. The
+    // temp file sits in the same directory so the rename stays on one
+    // filesystem. (Cross-run URL interleaving — run A's droid reading run
+    // B's freshly merged URL — is inherent to droid's cwd-fixed config path
+    // and can't be closed from here.)
+    let tmp_path = factory_dir.join(format!(".mcp.json.tmp-{}", std::process::id()));
+    std::fs::write(&tmp_path, json_str)?;
+    std::fs::rename(&tmp_path, &config_path)
+}
+
+/// Prepare a minimal Factory home for a droid agent at
+/// `<agent_home>/factory-home` and return the value to assign to
+/// `FACTORY_HOME_OVERRIDE` (droid resolves its home as
+/// `$FACTORY_HOME_OVERRIDE/.factory`, i.e. the override points at the
+/// PARENT of `.factory`). Returns `Ok(None)` when the user's real Factory
+/// home can't be located — droid then runs with its default home, exactly
+/// as before this hook existed.
+///
+/// Why this exists: `droid exec` connects EVERY server in the user-level
+/// `~/.factory/mcp.json` at startup, before its first model call, and the
+/// tool catalog shown to the model is snapshotted when the run starts.
+/// On a machine with a large or slow MCP roster, launchpad's own tools
+/// (delivered through the project `.factory/mcp.json`, see
+/// `merge_droid_mcp_config`) finish registering only after the model's
+/// first turn is already answered — so the run pays tens of seconds of
+/// connection latency AND the launchpad tools end up invisible to the
+/// model anyway (both verified empirically against droid 0.232.0). With a
+/// minimal home, droid connects exactly one server (launchpad's), startup
+/// drops to ~1-2s, and the bridge tools make the catalog every time.
+///
+/// The home carries copies of droid's auth material and user settings so
+/// the spawned CLI still runs as the logged-in user with their model
+/// preferences; the file set (`auth.v2.*` + `settings.json`) is what
+/// 0.232.0 needs, re-copied when the real home's copy is newer so token
+/// refreshes propagate. Sessions, logs, and caches deliberately stay in
+/// the per-agent home — that also keeps concurrent droid agents from
+/// contending on one sessions store.
+fn ensure_droid_factory_home(agent_home: &std::path::Path) -> std::io::Result<Option<String>> {
+    let real_factory_dir = std::env::var_os("FACTORY_HOME_OVERRIDE")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+        .map(|home| home.join(".factory"));
+    let Some(real_factory_dir) = real_factory_dir else {
+        return Ok(None);
+    };
+    if !real_factory_dir.is_dir() {
+        return Ok(None);
+    }
+    materialize_droid_factory_home(&real_factory_dir, agent_home).map(Some)
+}
+
+/// The file-materializing core of `ensure_droid_factory_home`, split out so
+/// tests can drive it without touching process env. Returns the value to
+/// assign to `FACTORY_HOME_OVERRIDE`.
+fn materialize_droid_factory_home(
+    real_factory_dir: &std::path::Path,
+    agent_home: &std::path::Path,
+) -> std::io::Result<String> {
+    let override_home = droid_factory_home_dir(agent_home);
+    let override_factory_dir = override_home.join(".factory");
+    std::fs::create_dir_all(&override_factory_dir)?;
+
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    for entry in std::fs::read_dir(real_factory_dir)? {
+        let name = entry?.file_name();
+        if name.to_string_lossy().starts_with("auth.v2") {
+            names.push(name);
+        }
+    }
+    names.push(std::ffi::OsString::from("settings.json"));
+
+    for name in names {
+        let source = real_factory_dir.join(&name);
+        let Ok(source_meta) = std::fs::metadata(&source) else {
+            continue;
+        };
+        let dest = override_factory_dir.join(&name);
+        let stale = match std::fs::metadata(&dest) {
+            Ok(dest_meta) => source_meta.modified().ok() > dest_meta.modified().ok(),
+            Err(_) => true,
+        };
+        if stale {
+            std::fs::copy(&source, &dest)?;
+        }
+    }
+
+    Ok(override_home.to_string_lossy().into_owned())
+}
+
+/// Keep the delivered droid MCP config out of the user's git status: when
+/// the spawn cwd is a git worktree (a `.git` entry — directory for a plain
+/// repo, file for a linked worktree), ensure `.factory/mcp.json` is covered
+/// by `.gitignore`. Factory's own docs warn that project-level mcp.json gets
+/// committed; launchpad's copy holds no secrets (a localhost URL) but
+/// churns on every run. Best-effort: any failure leaves the repo untouched,
+/// and an existing broader `.factory` ignore is respected rather than
+/// duplicated.
+fn gitignore_droid_mcp_config(cwd: &std::path::Path) {
+    // The spawn cwd is often a SUBDIRECTORY of the repo (agent working_dir /
+    // focus path) — the ignore rule must land at the enclosing repo root with
+    // the correct relative prefix, or the churn file still shows up in the
+    // user's git status. `.git` may be a directory (plain repo) or a file
+    // (linked worktree / submodule) — `.exists()` covers both.
+    let mut repo_root = None;
+    for ancestor in cwd.ancestors() {
+        if ancestor.join(".git").exists() {
+            repo_root = Some(ancestor);
+            break;
+        }
+    }
+    let Some(repo_root) = repo_root else { return };
+    // Repo-root-relative path of the delivered config, using the gitignore
+    // leading-slash form so it matches exactly that file.
+    let rel = cwd
+        .strip_prefix(repo_root)
+        .ok()
+        .filter(|r| !r.as_os_str().is_empty())
+        .map(|r| format!("/{}/.factory/mcp.json", r.to_string_lossy()))
+        .unwrap_or_else(|| "/.factory/mcp.json".to_string());
+    let path = repo_root.join(".gitignore");
+    let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+    let at_root = rel == "/.factory/mcp.json";
+    let covered = content.lines().any(|line| {
+        let line = line.trim();
+        // `rel` is root-anchored (leading `/`) — an exact hit covers this
+        // cwd. Anchored rules only cover the root-level case (a subdirectory
+        // cwd needs its own prefixed rule); the unanchored forms match at
+        // any depth.
+        line == rel
+            || (at_root && matches!(line, "/.factory" | "/.factory/"))
+            || matches!(line, ".factory/mcp.json" | ".factory" | ".factory/")
+    });
+    if covered {
+        return;
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&format!(
+        "# Written by Launchpad Studio for droid CLI agents (per-run MCP session URL)\n{}\n",
+        rel
+    ));
+    if let Err(e) = std::fs::write(&path, content) {
+        tracing::warn!(error = %e, "Failed to gitignore droid MCP config");
+    }
+}
+
+/// Where per-(provider, thread) CLI session ids are persisted for resume.
+fn cli_sessions_path(agent_home: &std::path::Path) -> std::path::PathBuf {
+    agent_home.join("cli-sessions.json")
+}
+
+/// How many turns a stored CLI session id is resumed before the next turn
+/// starts a fresh session. Resume replays the session's whole event history
+/// through the provider on every turn, so an uncapped thread gets slower
+/// with each exchange (measured: a ~950KB session costs ~4s/turn extra and
+/// grows unbounded). Forty turns keeps a conversation continuous for its
+/// natural lifetime while bounding the per-turn replay cost.
+const CLI_SESSION_MAX_RESUME_TURNS: u32 = 40;
+
+/// Byte ceiling for a resumable session. The turn cap above bounds how
+/// LONG a session lives; this bounds how FAT it gets. One tool-heavy turn
+/// (email dumps, big file reads) can add hundreds of KB, and droid replays
+/// the entire session through the provider on every model call — so a 1MB
+/// session adds tens of seconds to time-to-first-token and is
+/// re-transmitted on every tool round trip inside the run (measured: a
+/// ~1MB session produced 3.2M input tokens on a single two-tool turn).
+/// 256KB keeps plenty of conversational continuity while capping that
+/// replay cost.
+const CLI_SESSION_MAX_RESUME_BYTES: u64 = 256 * 1024;
+
+/// The per-agent droid factory home — `<agent_home>/factory-home`. Shared
+/// by [`materialize_droid_factory_home`] and [`cli_session_file_size`] so
+/// the byte-cap scan can never drift from the materializer's layout (a
+/// mismatch would silently disengage the cap).
+fn droid_factory_home_dir(agent_home: &std::path::Path) -> std::path::PathBuf {
+    agent_home.join("factory-home")
+}
+
+/// On-disk size of the droid session file for `session_id`, found under
+/// `<agent_home>/factory-home/.factory/sessions/<cwd-slug>/<id>.jsonl`.
+/// The cwd-slug level is droid-side path mangling we don't recompute —
+/// session ids are UUIDs, so scanning the single slug level for a matching
+/// file name is collision-free. Returns `None` when no copy is found (e.g.
+/// droid fell back to the user's default Factory home); the caller treats
+/// "unknown size" as "resumable" and lets the existing exit-code
+/// classification handle a genuinely stale id.
+fn cli_session_file_size(agent_home: &std::path::Path, session_id: &str) -> Option<u64> {
+    let sessions_root = droid_factory_home_dir(agent_home)
+        .join(".factory")
+        .join("sessions");
+    let file_name = format!("{session_id}.jsonl");
+    let read = match std::fs::read_dir(&sessions_root) {
+        Ok(read) => read,
+        Err(e) => {
+            // A missing root is the normal fallback-home case — stay quiet.
+            // An EXISTING but unreadable root would disengage the cap
+            // forever, so that one leaves a trail.
+            if sessions_root.exists() {
+                tracing::debug!(
+                    error = %e,
+                    root = %sessions_root.display(),
+                    "CLI session size scan: sessions root unreadable — byte cap skipped"
+                );
+            }
+            return None;
+        }
+    };
+    // Take the MAX across all slug dirs: resuming from different cwds can
+    // leave same-named copies behind, and first-match-wins could stat a
+    // stale small copy while the live one is over the cap. A single bad
+    // directory entry must not abort the scan either — a later slug dir may
+    // hold the fat copy.
+    let mut max_size: Option<u64> = None;
+    for entry in read {
+        let Ok(entry) = entry else { continue };
+        let candidate = entry.path().join(&file_name);
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            max_size = Some(max_size.map_or(meta.len(), |m| m.max(meta.len())));
+        }
+    }
+    max_size
+}
+
+/// Load the stored CLI session id for `key` (`"<command>:<thread>"`).
+/// Absent file, unreadable file, malformed JSON, a missing key, or a
+/// session that has already been resumed `CLI_SESSION_MAX_RESUME_TURNS`
+/// times all just mean "start a fresh session" — resume is an optimization,
+/// never a requirement.
+fn load_cli_session_id(agent_home: &std::path::Path, key: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(cli_sessions_path(agent_home)).ok()?;
+    let map: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let entry = map.get("sessions")?.get(key)?;
+    // Current format: {"id": "...", "turns": N}; legacy format: a bare id
+    // string (treated as zero resumes so far).
+    let (id, turns) = match entry {
+        serde_json::Value::String(s) => (s.as_str(), 0),
+        serde_json::Value::Object(_) => (
+            entry.get("id")?.as_str()?,
+            entry.get("turns").and_then(|t| t.as_u64()).unwrap_or(0) as u32,
+        ),
+        _ => return None,
+    };
+    if turns >= CLI_SESSION_MAX_RESUME_TURNS {
+        return None;
+    }
+    if let Some(size) = cli_session_file_size(agent_home, id) {
+        if size > CLI_SESSION_MAX_RESUME_BYTES {
+            tracing::info!(
+                session_id = %id,
+                scope_key = %key,
+                size_bytes = size,
+                cap = CLI_SESSION_MAX_RESUME_BYTES,
+                "CLI session exceeds the byte cap — starting a fresh session instead of resuming"
+            );
+            return None;
+        }
+    }
+    Some(id.to_string())
+}
+
+/// Record (`Some`) or clear (`None`) the CLI session id for `key`,
+/// read-merge-writing the store so other threads' and providers' ids
+/// survive. A malformed existing store is rebuilt — these ids are hints,
+/// not state worth failing a run over.
+fn store_cli_session_id(
+    agent_home: &std::path::Path,
+    key: &str,
+    session_id: Option<&str>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(agent_home)?;
+    let path = cli_sessions_path(agent_home);
+    let mut root: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let sessions = root
+        .as_object_mut()
+        .expect("root normalized to object above")
+        .entry("sessions")
+        .or_insert_with(|| serde_json::json!({}));
+    if !sessions.is_object() {
+        *sessions = serde_json::json!({});
+    }
+    let sessions = sessions.as_object_mut().expect("normalized above");
+    match session_id {
+        Some(id) => {
+            // Resume-turn bookkeeping (see CLI_SESSION_MAX_RESUME_TURNS):
+            // re-storing the SAME id means a turn just resumed it — count
+            // it. A different id is a fresh session — reset the counter.
+            let turns = match sessions.get(key) {
+                Some(serde_json::Value::Object(existing))
+                    if existing.get("id").and_then(|v| v.as_str()) == Some(id) =>
+                {
+                    existing.get("turns").and_then(|t| t.as_u64()).unwrap_or(0) as u32 + 1
+                }
+                Some(serde_json::Value::String(existing)) if existing == id => 1,
+                _ => 0,
+            };
+            sessions.insert(
+                key.to_string(),
+                serde_json::json!({ "id": id, "turns": turns }),
+            );
+        }
+        None => {
+            sessions.remove(key);
+        }
+    }
+    let json_str = serde_json::to_string_pretty(&root)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // Atomic write (temp + rename): a crash mid-write would otherwise leave
+    // malformed JSON, and two threads of the same agent can merge-write
+    // concurrently. Same-dir temp keeps the rename atomic. The temp name
+    // carries a per-process counter, not just the pid: two agents sharing a
+    // custom home (clones) write the SAME store path from the same process,
+    // and open-truncate-write on a shared temp name lets one writer tear
+    // the other's bytes mid-flight. Stale temps from a crash are harmless
+    // (the reader only ever opens the real path) and bounded by crash count.
+    static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let tmp_path = path.with_file_name(format!(
+        ".cli-sessions.tmp-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp_path, json_str)?;
+    std::fs::rename(&tmp_path, &path)
+}
+
+/// Map a process termination to the run's end reason.
+///
+/// "Natural" only means the process exited on its own — the supervisor
+/// doesn't look at the code. A nonzero exit (or a signal kill, which
+/// surfaces as `None` on unix) is a FAILED run: classifying it `Completed`
+/// would re-store a stale session id (wedging resume on every later turn)
+/// and skip the silent-failure bubble — exactly the failure modes those two
+/// mechanisms exist for.
+fn classify_end_reason(
+    reason: ao_process::supervisor::TerminationReason,
+    exit_code: Option<i32>,
+) -> RunEndReason {
+    use ao_process::supervisor::TerminationReason as TR;
+    match reason {
+        TR::Natural => match exit_code {
+            Some(0) => RunEndReason::Completed,
+            _ => RunEndReason::Error,
+        },
+        TR::Cancelled => RunEndReason::Cancelled,
+        TR::Timeout => RunEndReason::TimedOut,
+        TR::NoOutputTimeout => RunEndReason::NoOutputTimeout,
+        TR::Error => RunEndReason::Error,
+    }
+}
+
+/// Reclassify a clean exit that produced nothing user-visible. The process
+/// supervisor only sees the exit code: a flaky gateway that returns empty
+/// completions lets the CLI retry internally, give up, and exit 0 — a
+/// failure wearing a success code (observed in production: 79s of silence,
+/// then "Completed", and channel users got nothing at all). Anything
+/// visible — a text delta, a tool call, a form — keeps `Completed`: a
+/// tool-only turn is a legitimate turn. So does a dispatched terminal
+/// `<task>` action (`terminal_task_action_dispatched`): a bare-tag reply
+/// produces no text by design (it's suppressed), and in buffered Json
+/// output modes no deltas or tool events ever stream — without this signal
+/// a finished assignment turn would be misclassified as an empty failure.
+fn reclassify_empty_completion(
+    reason: RunEndReason,
+    terminal_text_emitted: bool,
+    visible_output_emitted: bool,
+    terminal_task_action_dispatched: bool,
+) -> RunEndReason {
+    if reason == RunEndReason::Completed
+        && !terminal_text_emitted
+        && !visible_output_emitted
+        && !terminal_task_action_dispatched
+    {
+        RunEndReason::CompletedEmpty
+    } else {
+        reason
+    }
+}
+
+/// Splice `session_arg <id>` into an argv produced by `build_argv`. With
+/// Arg input the user prompt is the final element and must stay last —
+/// CLIs treat the first free argument as the prompt — so the pair goes in
+/// just before it; with Stdin input there is no prompt argument and
+/// appending is safe.
+fn apply_session_arg(
+    argv: &mut Vec<String>,
+    session_arg: &str,
+    session_id: &str,
+    input_mode: &InputMode,
+) {
+    let pos = match input_mode {
+        InputMode::Arg => argv.len().saturating_sub(1),
+        _ => argv.len(),
+    };
+    argv.insert(pos, session_arg.to_string());
+    argv.insert(pos + 1, session_id.to_string());
+}
+
 /// Orchestrates a single agent run: process spawning, output normalization,
 /// event emission, and transcript persistence.
 pub struct CliAgentRunner {
@@ -797,15 +1247,32 @@ impl CliAgentRunner {
             }
         }
 
+        // Reasoning effort. `droid exec` takes it as `-r/--reasoning-effort
+        // <low|medium|high>` — the same wire strings `ReasoningEffort::as_str`
+        // produces — so the profile field maps 1:1. (`-r` means `--resume` in
+        // droid's interactive mode but `--reasoning-effort` in exec mode; the
+        // template always spawns `exec`, so the short flag is unambiguous
+        // here. The long form is used anyway for argv readability.)
+        if matches_command_basename(&cli.command, "droid") {
+            if let Some(effort) = agent.reasoning_effort {
+                argv.push("--reasoning-effort".to_string());
+                argv.push(effort.as_str().to_string());
+            }
+        }
+
         // Advertise MCP server config so the CLI discovers custom tools via MCP.
         // Codex has no `--mcp-config` flag (it hard-errors on unrecognized
         // arguments), so it needs the launchpad server injected through its own
         // `-c` config-override surface instead of the JSON file path other
-        // CLIs take. cursor-agent and agy likewise take no MCP-related argv at
-        // all here — each reads its own workspace-implicit JSON file instead
-        // (`.cursor/mcp.json` / `mcp_config.json`), written by the caller via
-        // `merge_cursor_mcp_config` / `merge_agy_mcp_config` once it knows the
-        // spawn's cwd (see `run_with_scope_inner`).
+        // CLIs take. cursor-agent, agy, and droid likewise take no MCP-related
+        // argv at all here — each reads its own workspace-implicit JSON file
+        // instead (`.cursor/mcp.json` / `~/.gemini/config/mcp_config.json` /
+        // `.factory/mcp.json`), written by the caller via
+        // `merge_cursor_mcp_config` / `merge_agy_mcp_config` /
+        // `merge_droid_mcp_config` once it knows the spawn's cwd (see
+        // `run_with_scope_inner`). droid specifically exits 2 on unrecognized
+        // flags and its `--settings` file ignores `mcpServers` — see the
+        // comment on `merge_droid_mcp_config`.
         if matches_command_basename(&cli.command, "codex") {
             if let Some(url) = mcp_server_url {
                 argv.extend(codex_mcp_server_config_overrides("launchpad", url));
@@ -823,6 +1290,7 @@ impl CliAgentRunner {
             }
         } else if matches_command_basename(&cli.command, "cursor-agent")
             || matches_command_basename(&cli.command, "agy")
+            || matches_command_basename(&cli.command, "droid")
         {
             // No argv flag — see comment above.
         } else if let Some(mcp_path) = mcp_config_path {
@@ -1732,6 +2200,32 @@ impl CliAgentRunner {
             }
         }
 
+        // droid: run against a minimal per-agent Factory home so startup
+        // isn't gated on connecting the user's whole MCP roster (see
+        // `ensure_droid_factory_home`). An explicit FACTORY_HOME_OVERRIDE in
+        // the agent's own `env` map wins — same precedence rule as the agy
+        // key above. The ambient process env deliberately does NOT count:
+        // an override inherited from whatever launched Launchpad (e.g. the
+        // Factory desktop harness sets one) is ambient, not a choice about
+        // this agent.
+        if matches_command_basename(&cli_config.command, "droid")
+            && !env_map.contains_key("FACTORY_HOME_OVERRIDE")
+        {
+            match ensure_droid_factory_home(&agent_home) {
+                Ok(Some(home)) => {
+                    env_map.insert("FACTORY_HOME_OVERRIDE".to_string(), home);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "Failed to prepare droid Factory home; run will use the default home"
+                    );
+                }
+            }
+        }
+
         let bg_env = Some(env_map);
 
         // Capture CWD and CLI config fields for the continuation loop inside the spawn block
@@ -1776,7 +2270,7 @@ impl CliAgentRunner {
         // HiddenTranscriptEntry) ride the hidden channel too.
         let bg_event_channel = event_channel;
         let bg_run_id = run_id.clone();
-        let _bg_agent_home = agent_home.clone();
+        let bg_agent_home = agent_home.clone();
         // Capture the assigned-task context (team_id, tasklist_id, task_id) so
         // the spawn closure can drive `<task action="...">` state transitions
         // without re-reading scope. Cloned from `tasklist_run_ctx` (which
@@ -1852,11 +2346,65 @@ impl CliAgentRunner {
             // drive the next step themselves.
             let mut bg_terminal_task_action_dispatched = false;
 
+            // Set when the terminal step flushed a buffered TextComplete —
+            // i.e. the agent produced a reply at all. Post-loop, a failed
+            // run with no reply gets a visible Error bubble instead of going
+            // quietly dark.
+            let mut bg_terminal_text_emitted = false;
+
+            // Set when any Error payload has already been emitted for this
+            // run (a streamed provider `error` event, or the normalizer's
+            // stderr-tail finalize arm). The post-loop silent-failure block
+            // checks this so a classified failure doesn't report twice.
+            let mut bg_error_emitted = false;
+
+            // Set when the run produced anything user-visible: streamed
+            // text, a tool call, a form. Distinguishes a genuinely empty
+            // exit-0 (provider returned nothing — a failure, reclassified to
+            // `CompletedEmpty` post-loop) from a legitimate tool-only turn.
+            // Thinking deltas deliberately don't count: a run that only
+            // reasoned and went quiet IS the empty-reply failure mode.
+            let mut bg_visible_output_emitted = false;
+
             let continuation_input = bg_initial_prompt.clone();
             // Deliberately uninitialized: every `break 'continuation` below must
             // assign it first, and the compiler enforces that. A default here
             // would let a future exit path report a failed run as `Completed`.
             let end_reason;
+
+            // CLI session resume. `session_arg`/`session_id_fields` existed
+            // on CliProviderConfig long before any runner honored them; this
+            // is the honoring. When the provider declares a resume flag
+            // (droid: `-s`), the id the normalizer captured from the previous
+            // run's stream (via `extract_session_id`) is spliced into the next
+            // turn's argv. Keyed by (agent, command, thread) so each
+            // conversation thread keeps its own CLI-side session and a
+            // provider switch never crosses session stores. The agent
+            // component is what keeps a clone on a SHARED custom home from
+            // resolving the parent's session: with only (command, thread),
+            // parent and clone both compute the same key against the same
+            // cli-sessions.json and splice the same provider session id
+            // into argv — two agents diverging inside one conversation.
+            // Delegated child runs stay
+            // stateless — resuming one would graft it onto an unrelated
+            // conversation. Failures clear the stored id (a stale or expired
+            // provider session must not wedge the agent); cancellation keeps
+            // it, since the CLI-side session is likely still valid.
+            let cli_session_scope_key = if !bg_is_delegated
+                && bg_cli_config.session_arg.is_some()
+            {
+                Some(format!(
+                    "{}:{}:{}",
+                    bg_agent_id,
+                    bg_cli_config.command,
+                    bg_thread_id.as_deref().unwrap_or("default")
+                ))
+            } else {
+                None
+            };
+            let mut cli_session_id = cli_session_scope_key
+                .as_deref()
+                .and_then(|key| load_cli_session_id(&bg_agent_home, key));
 
             // TimelineAdapter accumulates transcript entries across the full
             // chain and flushes them in one persist_pending() call before
@@ -1927,14 +2475,15 @@ impl CliAgentRunner {
                 mcp_json_path: step_mcp_config.clone(),
             };
 
-            // cursor-agent and agy have no per-invocation MCP config flag (see
-            // `merge_cursor_mcp_config` / `merge_agy_mcp_config`); deliver it
-            // by writing each one's implicit config file here instead —
-            // cursor-agent's is workspace-scoped (the spawn's actual cwd is
-            // known at this point), agy's is a single global file with no
-            // per-project override. Failure degrades to a tool-less run
-            // rather than aborting the spawn — matches how a missing
-            // mcp_config_path degrades other providers.
+            // cursor-agent, agy, and droid have no per-invocation MCP config
+            // flag (see `merge_cursor_mcp_config` / `merge_agy_mcp_config` /
+            // `merge_droid_mcp_config`); deliver it by writing each one's
+            // implicit config file here instead — cursor-agent's and droid's
+            // are workspace-scoped (the spawn's actual cwd is known at this
+            // point), agy's is a single global file with no per-project
+            // override. Failure degrades to a tool-less run rather than
+            // aborting the spawn — matches how a missing mcp_config_path
+            // degrades other providers.
             let ProviderConfig::Cli(ref run_agent_cli) = run_agent.provider;
             if matches_command_basename(&run_agent_cli.command, "cursor-agent") {
                 if let Err(e) =
@@ -1956,15 +2505,31 @@ impl CliAgentRunner {
                         "Failed to write agy MCP config; run will proceed without Launchpad tools"
                     );
                 }
+            } else if matches_command_basename(&run_agent_cli.command, "droid") {
+                match merge_droid_mcp_config(std::path::Path::new(&bg_cwd), &step_mcp_url)
+                {
+                    Ok(()) => gitignore_droid_mcp_config(std::path::Path::new(&bg_cwd)),
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = %bg_agent_id,
+                            cwd = %bg_cwd,
+                            error = %e,
+                            "Failed to write droid MCP config; run will proceed without Launchpad tools"
+                        );
+                    }
+                }
             }
 
             // Build argv and spawn the binary for this continuation step.
-            let step_argv = CliAgentRunner::build_argv(
+            let mut step_argv = CliAgentRunner::build_argv(
                 &run_agent,
                 &continuation_input,
                 Some(&step_mcp_config),
                 Some(&step_mcp_url),
             );
+            if let (Some(arg), Some(id)) = (&run_agent_cli.session_arg, &cli_session_id) {
+                apply_session_arg(&mut step_argv, arg, id, &bg_input_mode);
+            }
             let step_stdin = if bg_input_mode == InputMode::Stdin {
                 Some(continuation_input.clone())
             } else {
@@ -2433,6 +2998,27 @@ impl CliAgentRunner {
                             );
                         }
 
+                        if matches!(&payload, AgentEventPayload::Error { .. }) {
+                            bg_error_emitted = true;
+                        }
+                        // TextComplete never reaches here (buffered above for
+                        // the terminal step — `bg_terminal_text_emitted`
+                        // covers it); everything else visible is tracked so a
+                        // tool-only turn isn't reclassified as an empty run.
+                        // Empty TextDeltas (a tag the scanner stripped to
+                        // nothing) don't count — the CompletedEmpty guard
+                        // must not rest on an accident of the strip pipeline.
+                        if matches!(
+                            &payload,
+                            AgentEventPayload::TextDelta { text } if !text.is_empty()
+                        ) || matches!(
+                            &payload,
+                            AgentEventPayload::ToolCallStarted { .. }
+                                | AgentEventPayload::ToolUseStarted { .. }
+                                | AgentEventPayload::FormRequest { .. }
+                        ) {
+                            bg_visible_output_emitted = true;
+                        }
                         runner
                             .event_bus
                             .emit(&bg_run_id, &bg_event_agent_id, bg_thread_id.clone(), payload)
@@ -2505,6 +3091,17 @@ impl CliAgentRunner {
 
             // Finalize normalizer
             let final_payloads = normalizer.finalize(run_exit.exit_code, &stderr_str);
+
+            // Resume bookkeeping (see the declaration above the loop): each
+            // step's normalizer holds the session id that step's stream
+            // reported; the next continuation step — or the next turn —
+            // resumes from it. Updated even on failed steps; the post-loop
+            // persist decides whether the id survives a failed run.
+            if cli_session_scope_key.is_some() {
+                if let Some(id) = normalizer.extract_session_id() {
+                    cli_session_id = Some(id);
+                }
+            }
             for mut payload in final_payloads {
                 // Flush any in-flight action tags from the primary stream
                 // through the same scanner, so orphan-open tags at process
@@ -2794,6 +3391,25 @@ impl CliAgentRunner {
                         step_buffered_text_complete = Some(payload);
                         continue;
                     }
+                    if matches!(&payload, AgentEventPayload::Error { .. }) {
+                        bg_error_emitted = true;
+                    }
+                    // Finalize-produced events count as visible output too:
+                    // a stream whose final line arrives without a trailing
+                    // newline is only parsed here, and buffered (Json-mode)
+                    // normalizers produce ALL their events here. Missing
+                    // this loop would read those turns as empty.
+                    if matches!(
+                        &payload,
+                        AgentEventPayload::TextDelta { text } if !text.is_empty()
+                    ) || matches!(
+                        &payload,
+                        AgentEventPayload::ToolCallStarted { .. }
+                            | AgentEventPayload::ToolUseStarted { .. }
+                            | AgentEventPayload::FormRequest { .. }
+                    ) {
+                        bg_visible_output_emitted = true;
+                    }
                     runner
                         .event_bus
                         .emit(&bg_run_id, &bg_event_agent_id, bg_thread_id.clone(), payload)
@@ -2803,21 +3419,112 @@ impl CliAgentRunner {
 
             // Terminal step: emit buffered TextComplete and end.
             if let Some(tc) = step_buffered_text_complete.take() {
+                bg_terminal_text_emitted = true;
                 runner
                     .event_bus
                     .emit(&bg_run_id, &bg_event_agent_id, bg_thread_id.clone(), tc)
                     .await;
             }
-            end_reason = match run_exit.reason {
-                ao_process::supervisor::TerminationReason::Natural => RunEndReason::Completed,
-                ao_process::supervisor::TerminationReason::Cancelled => RunEndReason::Cancelled,
-                ao_process::supervisor::TerminationReason::Timeout => RunEndReason::TimedOut,
-                ao_process::supervisor::TerminationReason::NoOutputTimeout => RunEndReason::NoOutputTimeout,
-                ao_process::supervisor::TerminationReason::Error => RunEndReason::Error,
-            };
+            end_reason = classify_end_reason(run_exit.reason, run_exit.exit_code);
             break 'continuation;
 
             } // end 'continuation loop
+
+            // Exit-0 with nothing to show for it is an empty-reply failure,
+            // not a completed turn — see `reclassify_empty_completion`.
+            // Shadowing keeps every downstream consumer (session policy,
+            // silent-failure bubble, RunEnded, assignment completion branch)
+            // looking at the corrected reason.
+            let end_reason = reclassify_empty_completion(
+                end_reason,
+                bg_terminal_text_emitted,
+                bg_visible_output_emitted,
+                bg_terminal_task_action_dispatched,
+            );
+
+            // Persist (or clear) the CLI session id per the policy declared
+            // at `cli_session_scope_key`: a completed run stores the latest
+            // captured id; a failed run clears it so the next turn starts
+            // fresh instead of wedging on a stale provider session; a
+            // cancelled run leaves the store untouched. A completed run that
+            // captured no id (provider without session support, or a stream
+            // that never reported one) also leaves the store untouched.
+            if let Some(key) = cli_session_scope_key.as_deref() {
+                let update = match end_reason {
+                    RunEndReason::Completed => cli_session_id.as_deref().map(Some),
+                    RunEndReason::Cancelled => None,
+                    // An empty-reply failure doesn't mean the provider
+                    // session is broken, but its last recorded turn is a
+                    // dud — treat it like any other failed run and let the
+                    // next turn start fresh (thread history injection still
+                    // carries the conversation).
+                    RunEndReason::CompletedEmpty => Some(None),
+                    _ => Some(None),
+                };
+                if let Some(id) = update {
+                    if let Err(e) = store_cli_session_id(&bg_agent_home, key, id) {
+                        tracing::warn!(
+                            agent_id = %bg_agent_id,
+                            run_id = %bg_run_id,
+                            error = %e,
+                            "Failed to persist CLI session id; next turn will start a fresh session"
+                        );
+                    }
+                }
+            }
+
+            // Surface silent failures. A CLI run that dies without producing
+            // any reply (watchdog kill during a slow startup, exit-1 before
+            // first output, spawn failure) otherwise leaves an empty bubble
+            // and no explanation in chat — the user just watches the agent go
+            // quiet (observed with a stale droid binary: every turn failed
+            // invisibly). Runs that DID flush a TextComplete keep silent —
+            // their content already landed. Scoped to interactive chat:
+            // delegated children and team runs report through their own
+            // channels.
+            if !bg_is_delegated
+                && !bg_is_team
+                && !bg_terminal_text_emitted
+                // CompletedEmpty bypasses the error-emitted suppression:
+                // droid's finalize turns ANY stderr noise into an Error
+                // payload, so requiring !bg_error_emitted would silence the
+                // friendly bubble in exactly the flaky-gateway case it
+                // exists for, leaving only a raw stderr dump. Genuine
+                // errors (exit nonzero) keep the no-double-report rule.
+                && (!bg_error_emitted || end_reason == RunEndReason::CompletedEmpty)
+                && !matches!(end_reason, RunEndReason::Completed | RunEndReason::Cancelled)
+            {
+                let detail = match end_reason {
+                    RunEndReason::NoOutputTimeout => format!(
+                        "it produced no output for {}s and was stopped — usually a slow startup (MCP servers connecting) or a hung process",
+                        bg_no_output_timeout_ms / 1000
+                    ),
+                    RunEndReason::TimedOut => format!(
+                        "it exceeded the {}s run timeout",
+                        bg_timeout_ms / 1000
+                    ),
+                    RunEndReason::CompletedEmpty => {
+                        "the model returned an empty reply — usually a transient provider issue"
+                            .to_string()
+                    }
+                    _ => "the CLI exited with an error before producing a reply".to_string(),
+                };
+                runner
+                    .event_bus
+                    .emit(
+                        &bg_run_id,
+                        &bg_event_agent_id,
+                        bg_thread_id.clone(),
+                        AgentEventPayload::Error {
+                            message: format!(
+                                "Run failed: {}. Your message was not processed — send it again to retry.",
+                                detail
+                            ),
+                            recoverable: true,
+                        },
+                    )
+                    .await;
+            }
 
             // end_reason is set inside the loop (terminal step, cancellation, or cap trip).
             // Log non-successful terminations.

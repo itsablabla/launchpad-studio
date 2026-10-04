@@ -301,6 +301,16 @@ export interface AgentProfile {
   /** Archival copy of persona/special_instructions (or the legacy system_prompt) prior to
    *  the most recent AgentAuthor-driven update — a one-step undo, not a migration artifact. */
   legacy_system_prompt?: string | null;
+  /** When true, the system-prompt composer omits the platform-level instruction
+   *  blocks (baseline tool routing, CLI tool preference, memory-save guidance).
+   *  Not user-editable in the modal — declared here so a full-profile PUT
+   *  round-trip preserves it (the server deserializes the whole profile). */
+  minimal_prompt?: boolean | null;
+  /** Per-agent override for how deep delegate chains may nest under this
+   *  agent. Mirrors the backend `Option<u32>` — `null`/omitted defers to
+   *  the subagent spawner / Delegate-tool caps. Not editable in the modal;
+   *  carried through on save so a PUT doesn't silently strip it. */
+  max_delegation_depth?: number | null;
   /** Telegram bridge configuration. Input-only legacy shape — the server
    *  folds this into `channels` on deserialize (see `AgentProfileWire` in
    *  `crates/ao-protocol/src/agent.rs`) and never re-emits it on output, so a
@@ -319,7 +329,7 @@ export interface AgentProfile {
  *  agent, e.g. a Telegram bot or a polled email inbox. */
 export interface ChannelBinding {
   binding_id: string;
-  kind: "telegram" | "discord" | "email" | "slack" | "whatsapp" | "webhook";
+  kind: "telegram" | "discord" | "email" | "slack" | "whatsapp" | "webhook" | "matrix";
   enabled: boolean;
   /** The single thread all inbound/outbound traffic for this binding flows
    *  through. Server-owned; `null`/omitted until enabling has provisioned it. */

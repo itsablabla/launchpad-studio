@@ -56,6 +56,13 @@ export interface CoordinatorConfigFieldsValue {
     maxTurns: string;
     clearEnv: boolean;
     env: Record<string, string>;
+    /** Response fields the normalizer scans for the CLI session id
+     *  (`provider.session_id_fields` on the wire). Not rendered as an
+     *  editable control — carried through state so a template's (or a
+     *  yaml-authored profile's) resume wiring survives a modal Save
+     *  instead of being flattened to `[]`, which would silently break
+     *  session resume for that agent. */
+    sessionIdFields: string[];
     runnerMode: AgentRunnerMode;
     nativeProvider: AgentNativeProvider;
 }
@@ -166,6 +173,7 @@ export const DEFAULT_COORDINATOR_CONFIG_VALUE: CoordinatorConfigFieldsValue = {
     env: {},
     runnerMode: "cli",
     nativeProvider: "anthropic",
+    sessionIdFields: [],
 };
 
 export function coordinatorConfigFromProfile(profile: AgentProfile | undefined): CoordinatorConfigFieldsValue {
@@ -191,6 +199,7 @@ export function coordinatorConfigFromProfile(profile: AgentProfile | undefined):
         env: profile?.env ?? {},
         runnerMode: profile?.runner_mode ?? "cli",
         nativeProvider: profile?.native_provider ?? "anthropic",
+        sessionIdFields: profile?.provider?.session_id_fields ?? [],
     };
 }
 
@@ -263,10 +272,10 @@ export function CoordinatorConfigFields({ value, onChange, idPrefix = "ae-", dis
                                 onClick={() => update({ selectedTemplate: null })}
                             />
                             {CLI_TEMPLATES.map((tpl) => {
-                                const available = cliAvailability[tpl.id];
-                                const isDetecting = available === null;
+                                const detection = cliAvailability[tpl.id];
+                                const isDetecting = detection.status === "probing";
                                 const isSelected = value.selectedTemplate === tpl.id;
-                                const isDisabled = available === false;
+                                const isDisabled = detection.status === "missing" || detection.status === "stale";
                                 return (
                                     <TemplateChip
                                         key={tpl.id}
@@ -275,7 +284,13 @@ export function CoordinatorConfigFields({ value, onChange, idPrefix = "ae-", dis
                                         disabled={isDisabled}
                                         trailing={
                                             isDetecting ? <Loader2 className="w-[11px] h-[11px] animate-spin text-[var(--modal-text-tertiary)]" />
-                                                : available ? <span className="w-[6px] h-[6px] rounded-full bg-green-500" />
+                                                : detection.status === "ok" ? <span className="w-[6px] h-[6px] rounded-full bg-green-500" />
+                                                    : detection.status === "stale" ? (
+                                                        <span
+                                                            className="text-[10px] text-amber-500 italic"
+                                                            title={`${tpl.label} ${detection.version} found, but this integration needs ${tpl.minVersion} or newer — an older binary earlier on PATH may be shadowing the current one.`}
+                                                        >outdated</span>
+                                                    )
                                                     : <span className="text-[10px] text-[var(--modal-text-tertiary)] italic">not found</span>
                                         }
                                         onClick={() => !isDisabled && update({ selectedTemplate: tpl.id })}

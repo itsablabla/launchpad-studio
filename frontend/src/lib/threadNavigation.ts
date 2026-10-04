@@ -23,6 +23,7 @@ export const CHANNEL_KIND_LABELS: Record<ChannelBinding["kind"], string> = {
   slack: "Slack",
   whatsapp: "WhatsApp",
   webhook: "Webhook",
+  matrix: "Matrix",
 };
 
 /** The `kind` of the enabled channel binding whose dedicated bridge thread is

@@ -71,12 +71,12 @@ describe("everShownThisTurn latch", () => {
     expect(everShown(AGENT_ID)).toBe(true);
     expect(store().inFlightByAgent.get(AGENT_ID)?.activeToolCalls.length).toBe(1);
 
-    // Tool call finishes — the chip is marked done in place, NOT removed
-    // (see markInFlightToolCallDone / the "jumpy tool indicator" fix), so
-    // the array no longer drains to empty at this point.
+    // Tool call finishes — the chip moves into the turn's persistent
+    // completedToolCalls transcript (see markInFlightToolCallDone), which
+    // keeps the bubble contentful just like the chip did.
     store().markInFlightToolCallDone(AGENT_ID);
-    expect(store().inFlightByAgent.get(AGENT_ID)?.activeToolCalls.length).toBe(1);
-    expect(store().inFlightByAgent.get(AGENT_ID)?.activeToolCalls[0]?.done).toBe(true);
+    expect(store().inFlightByAgent.get(AGENT_ID)?.activeToolCalls.length).toBe(0);
+    expect(store().inFlightByAgent.get(AGENT_ID)?.completedToolCalls?.length).toBe(1);
     expect(everShown(AGENT_ID)).toBe(true);
 
     // The array only actually empties via a real flush point (text_delta's

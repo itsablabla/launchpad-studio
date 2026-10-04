@@ -450,7 +450,7 @@ export async function getTelegramStatus(agentId: string): Promise<TelegramStatus
 }
 
 /** Mint a fresh single-use Telegram pairing code for an agent
- *  (`POST …/telegram/pairing-code`), valid for 10 minutes. Regenerating
+ *  (`POST …/telegram/pairing-code`), valid for 30 minutes. Regenerating
  *  overwrites any prior unclaimed code. */
 export async function createTelegramPairingCode(agentId: string): Promise<PairingCode> {
   const res = await fetch(`${BASE_URL}/agents/${encodeURIComponent(agentId)}/telegram/pairing-code`, {
@@ -491,6 +491,107 @@ export async function unlinkTelegramChat(agentId: string, chatId: number): Promi
 }
 
 // ---------------------------------------------------------------------------
+// Matrix channel connection (dedicated endpoints, mirroring Telegram's)
+// ---------------------------------------------------------------------------
+
+export interface MatrixConnectionResult {
+  user_id: string;
+}
+
+export interface MatrixStatus {
+  has_token: boolean;
+  homeserver_url: string | null;
+  bot_user_id: string | null;
+  enabled: boolean;
+  connection_state: ChannelConnectionState;
+  linked: boolean;
+  /** Linked room ids (`!…`) only — the pairing flow also stores sender
+   *  MXIDs for the invite gate; those are not conversations and are never
+   *  returned here (mirrors the backend's `MatrixStatusResponse`). */
+  linked_rooms: string[];
+  pending_pairing_code?: PairingCode | null;
+}
+
+/** Body for `PUT …/matrix/connection`: exactly one auth shape — a raw
+ *  access token (advanced) or a username/password pair the backend logs in
+ *  with once, keeping the minted token + device id and discarding the
+ *  password. */
+export interface SetMatrixConnectionRequest {
+  homeserver_url: string;
+  access_token?: string;
+  username?: string;
+  password?: string;
+}
+
+async function parseChannelError(res: Response): Promise<never> {
+  const body = await res.text().catch(() => "");
+  let message = body || `Request failed with status ${res.status}`;
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed && typeof parsed.error === "string") message = parsed.error;
+  } catch {
+    // body wasn't JSON — fall through with raw text
+  }
+  throw new ApiError(res.status, message);
+}
+
+/** Validate and store a Matrix connection for an agent
+ *  (`PUT …/matrix/connection`). The token (and, on the password path, the
+ *  password) is write-only: validated against the homeserver before being
+ *  vaulted, never returned. Throws `ApiError` (400) with the backend's
+ *  sanitized message on an invalid token/credentials or unreachable
+ *  homeserver, 404 for an unknown agent. */
+export async function setMatrixConnection(agentId: string, req: SetMatrixConnectionRequest): Promise<MatrixConnectionResult> {
+  const res = await fetch(`${BASE_URL}/agents/${encodeURIComponent(agentId)}/matrix/connection`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) await parseChannelError(res);
+  return res.json() as Promise<MatrixConnectionResult>;
+}
+
+/** Remove a Matrix connection (`DELETE …/matrix/connection`): deletes the
+ *  vaulted token + device id, disables the binding, and revokes every
+ *  linked room and sender. Resolves with no body on success (204). */
+export async function deleteMatrixConnection(agentId: string): Promise<void> {
+  const res = await fetch(`${BASE_URL}/agents/${encodeURIComponent(agentId)}/matrix/connection`, { method: "DELETE" });
+  if (!res.ok) await parseChannelError(res);
+}
+
+/** Fetch non-secret Matrix channel status for an agent (`GET …/matrix/status`)
+ *  — never includes the access token. Unlike Telegram's status endpoint this
+ *  one already carries the live `connection_state`, so no second fetch
+ *  against `GET …/channels` is needed. */
+export async function getMatrixStatus(agentId: string): Promise<MatrixStatus> {
+  const res = await fetch(`${BASE_URL}/agents/${encodeURIComponent(agentId)}/matrix/status`);
+  if (!res.ok) await parseChannelError(res);
+  return res.json() as Promise<MatrixStatus>;
+}
+
+/** Mint a fresh single-use Matrix pairing code for an agent
+ *  (`POST …/matrix/pairing-code`), valid for 30 minutes. Regenerating
+ *  overwrites any prior unclaimed code. */
+export async function createMatrixPairingCode(agentId: string): Promise<PairingCode> {
+  const res = await fetch(`${BASE_URL}/agents/${encodeURIComponent(agentId)}/matrix/pairing-code`, { method: "POST" });
+  if (!res.ok) await parseChannelError(res);
+  return res.json() as Promise<PairingCode>;
+}
+
+/** Unlink a paired Matrix room from an agent
+ *  (`DELETE …/matrix/rooms/{roomId}`), returning the updated room list.
+ *  Also leaves the room best-effort via the live connection; the sender's
+ *  own MXID link (used by the invite gate) is kept. */
+export async function unlinkMatrixRoom(agentId: string, roomId: string): Promise<{ linked_rooms: string[] }> {
+  const res = await fetch(
+    `${BASE_URL}/agents/${encodeURIComponent(agentId)}/matrix/rooms/${encodeURIComponent(roomId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) await parseChannelError(res);
+  return res.json() as Promise<{ linked_rooms: string[] }>;
+}
+
+// ---------------------------------------------------------------------------
 // Channel bindings (generic status + Email config/secret/delete)
 // ---------------------------------------------------------------------------
 
@@ -504,7 +605,7 @@ export type ChannelConnectionState = "connected" | "reconnecting" | "disconnecte
 
 export interface ChannelStatus {
   binding_id: string;
-  kind: "telegram" | "discord" | "email" | "slack" | "whatsapp" | "webhook";
+  kind: "telegram" | "discord" | "email" | "slack" | "whatsapp" | "webhook" | "matrix";
   enabled: boolean;
   bridge_thread_provisioned: boolean;
   allowed_senders: string[];
